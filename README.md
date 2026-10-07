@@ -4,10 +4,6 @@ A Telegram **and** Discord bot that logs into the **Caffi** app (`vn.caffiliate.
 username/password + OTP and performs the daily check-in at **00:00 (midnight) Vietnam time**. When
 the server drops the session, the bot messages you to log in again.
 
-It does the same for **Shopee's** daily _Điểm Danh Nhận Xu_ — a second, unrelated provider with its
-own login (a pasted browser cookie instead of a password), its own endpoints and its own schedule.
-See [Shopee check-in](#shopee-check-in).
-
 The transports are [grammY](https://grammy.dev) for Telegram and
 [discordeno](https://discordeno.js.org) for Discord — long polling, retries, offsets and 409
 conflict handling all come from the libraries. Both sides share one command layer
@@ -22,8 +18,8 @@ layer and the check-in arithmetic are the same in both — see
 
 **Anyone can use the bot.** Every chat is keyed by its own id (`tg:<chat>` / `ds:<user>`), so each
 person manages exactly one set of accounts and can never see another user's data. On Discord every
-reply is ephemeral, and the credential commands — `/login` and `/shopee-login` — are restricted to
-DMs so secrets never land in a server channel.
+reply is ephemeral, and the `/login` family is restricted to DMs so credentials never land in a
+server channel.
 
 ## Where the API came from
 
@@ -134,43 +130,6 @@ one that continues at 00:00:03 count as the same run — no double check-in acro
   `TOKEN_INVALID` / `NOT_AUTHENTICATED` mean the session is gone → the bot asks you to log in again.
 - The wallet balance is nested: `response.wallet.balance`.
 
-## Shopee check-in
-
-Shopee is not an app-token API: there is no login to run, only a **browser cookie** to keep. Every
-endpoint below was pulled out of the JS that `https://shopee.vn/shopee-coins` lazy-loads
-(`dailycheckin/pcmall-dailycheckin.*.js`) — the full write-up is in
-[`docs/shopee-api.md`](docs/shopee-api.md).
-
-```
-/shopee-login <name> <cookie>   ← paste the Cookie header of a signed-in shopee.vn tab (DM only)
-/shopee [name]                  ← today's state: checked in?, streak day, reward schedule
-/shopee-checkin [name]          ← check in right now
-/shopee-auto on|off [name]      ← auto check-in for that session
-/shopee-del [name]              ← forget the cookie
-```
-
-| Endpoint                        | Verb | Why                                                           |
-| ------------------------------- | ---- | ------------------------------------------------------------- |
-| `/mkt/coins/api/v2/settings`    | GET  | who you are + whether today is already covered — read-only    |
-| `/mkt/coins/api/v2/checkin_new` | POST | the check-in. **The only write this provider ever performs.** |
-
-Both go to `https://games-dailycheckin.shopee.vn/…` (not `shopee.vn` — the bundle builds its axios
-base as `https://games-dailycheckin.${locale}/`, and `locale` for Vietnam is `shopee.vn`), and both
-carry the two hand-set headers the page sends: `dci-version: 4008000` and `check-in-origin: pc`.
-There is no signature. An expired cookie comes back as HTTP 401
-`{"code":401,"msg":"Unauthorization with sso"}`, which the bot turns into a "paste a new cookie"
-message and then reminds you about once every 24 hours.
-
-**When the day rolls.** Shopee stamps its own clock at **+08:00** while Vietnam is +07:00, so the
-reset is either 23:00 VN (the cluster's midnight) or 00:00 VN. Two runs cover both: one at **00:00
-VN** and a catch-up at **00:30 VN**. A run that finds the day already covered (checked by you in the
-app, or because the server has not flipped yet) posts nothing and lets the catch-up look again; a
-run that gets credited records `lastCheckInDay` and the catch-up stands down. Unlike Caffi there is
-no race to win — the reward is the same whenever in the day it lands — so neither job naps.
-
-Nothing else is called: no voucher redeem, no order, no profile. `deno task shopee` and the Shopee
-section of `deno task deploycheck` pin that down offline, including "exactly one POST per run".
-
 ## Setup
 
 ```bash
@@ -196,10 +155,10 @@ openssl rand -hex 32
 3. Restart. On start-up the bot pushes its slash commands globally; Discord can take up to an hour
    to show them the first time.
 4. Only for the webhook shape (Deno Deploy): copy **General Information → Public Key** into
-   `DISCORD_PUBLIC_KEY` and set **Interactions Endpoint URL** to `PUBLIC_URL/discord`. Discord signs
-   a PING with that public key and wants its `challenge` echoed back — when the handshake fails the
-   slash commands stay dead while everything else still looks fine, so it is worth checking the logs
-   for `[discord] ping from Discord`.
+   `DISCORD_PUBLIC_KEY` and set **Interactions Endpoint URL** to `PUBLIC_URL/discord`. Discord
+   signs a PING with that public key and wants its `challenge` echoed back — when the handshake
+   fails the slash commands stay dead while everything else still looks fine, so it is worth
+   checking the logs for `[discord] ping from Discord`.
 
 With `DISCORD_TOKEN` empty the Discord side is skipped entirely.
 
@@ -210,8 +169,8 @@ deno task logo   # name, description and short description on Telegram + the Dis
 ```
 
 Everything comes from `assets/logo.png`, the icon lifted out of the APK. The picture itself has to
-be set by hand on Telegram: the Bot API has no call for a bot's own photo, so send `assets/logo.png`
-to @BotFather and run `/setuserpic` there.
+be set by hand on Telegram: the Bot API has no call for a bot's own photo, so send
+`assets/logo.png` to @BotFather and run `/setuserpic` there.
 
 ## Using the bot
 
@@ -244,16 +203,10 @@ Both platforms understand the same commands:
 /use <name>                        ← pick the active account
 /auto on|off                       ← auto check-in for the active account
 /logout [name]                     ← remove an account from the bot
-/shopee-login <name> <cookie>      ← save a Shopee web session (Discord: DM only)
-/shopee [name]                     ← Shopee: today's state + the reward schedule
-/shopee-checkin [name]             ← check in on Shopee right now
-/shopee-auto on|off [name]         ← auto check-in for that Shopee session
-/shopee-del [name]                 ← forget the cookie
 ```
 
 Every command from `/orders` down to `/shops` is **read-only**: the bot fetches and displays, it
-never acts on your account. The only writes it ever performs are the login flow, `/checkin` and
-`/shopee-checkin` — one POST to Shopee's `checkin_new`, nothing else.
+never acts on your account. The only writes it ever performs are the login flow and `/checkin`.
 
 Each chat can hold **several accounts**; switch the active one with `/use <name>`.
 
@@ -263,11 +216,8 @@ Each chat can hold **several accounts**; switch the active one with `/use <name>
   logout. "Re-login automatically" is impossible without storing the password.
 - Data is stored **per chat id**. There is no allowlist and no shared state: `/accounts`, `/wallet`
   and everything else only ever read the caller's own records.
-- Discord replies are ephemeral, and `/login`, `/otp`, `/resend`, `/cancel` and `/shopee-login` are
-  hidden outside DMs, so a password typed in a server channel cannot even be submitted.
-- Shopee takes no password at all — only the `Cookie` of a signed-in tab. It is stored under the
-  same sealed store and sent to exactly one host: `games-dailycheckin.shopee.vn`. `/shopee-del`
-  forgets it.
+- Discord replies are ephemeral, and `/login`, `/otp`, `/resend` and `/cancel` are hidden outside
+  DMs, so a password typed in a server channel cannot even be submitted.
 - Without `BOT_SECRET` the store is written **plaintext** — the bot warns about it. On Deno Deploy
   the payload is sealed the same way before it reaches Deno KV.
 - Locally everything lives in `data/` — do not commit it. On Deno Deploy the same records live in
@@ -278,12 +228,12 @@ Each chat can hold **several accounts**; switch the active one with `/use <name>
 Deno Deploy has no writable filesystem and no single long-lived process, so there the bot runs
 `RUNTIME_MODE=webhook` (`src/main.ts`):
 
-|          | local (`deno task start`)                  | Deno Deploy                                                 |
-| -------- | ------------------------------------------ | ----------------------------------------------------------- |
-| Telegram | grammY long polling                        | `POST /telegram`, `X-Telegram-Bot-Api-Secret-Token` checked |
-| Discord  | gateway                                    | `POST /discord`, Ed25519 over `timestamp + body`            |
-| state    | `data/store.kv` (`store.json` before that) | Deno KV, one record under `["caffi", "store"]`              |
-| schedule | timers in `src/scheduler.ts`               | two `Deno.cron` jobs from `src/cron.ts`                     |
+|             | local (`deno task start`)                        | Deno Deploy                                                |
+| ----------- | ------------------------------------------------ | ----------------------------------------------------------- |
+| Telegram    | grammY long polling                              | `POST /telegram`, `X-Telegram-Bot-Api-Secret-Token` checked |
+| Discord     | gateway                                          | `POST /discord`, Ed25519 over `timestamp + body`            |
+| state       | `data/store.kv` (`store.json` before that)       | Deno KV, one record under `["caffi", "store"]`              |
+| schedule    | timers in `src/scheduler.ts`                     | two `Deno.cron` jobs from `src/cron.ts`                     |
 
 The handler still naps to the exact second (`msUntilWindow`), so the cron only has to wake an
 isolate at the right minute: `caffi-checkin-pre-roll` at `59 16 * * *` UTC (23:59 VN) and
@@ -314,11 +264,12 @@ deno deploy database assign <db> --org <org> --app <app>
 deno deploy --prod --non-interactive --org <org> --app <app> .
 ```
 
-Without step 2 the first boot dies with _"no KV database is attached to this app"_.
+Without step 2 the first boot dies with *"no KV database is attached to this app"*.
 
-**Bringing the accounts over.** There is no `data/store.json` on Deno Deploy, so the KV starts empty
-and every account has to be logged in again. To keep the ones you already have, hand the file over
-as an env var — it is still sealed with `BOT_SECRET`, so the platform only ever stores ciphertext:
+**Bringing the accounts over.** There is no `data/store.json` on Deno Deploy, so the KV starts
+empty and every account has to be logged in again. To keep the ones you already have, hand the
+file over as an env var — it is still sealed with `BOT_SECRET`, so the platform only ever stores
+ciphertext:
 
 ```bash
 deno deploy env add --secret STORE_IMPORT "$(tr -d '\n' < data/store.json)" \
@@ -354,7 +305,6 @@ deno task lint
 deno task timing        # offline: midnight window, poll cadence, check-in decision rules
 deno task view          # offline: every screen rendered as Telegram HTML + Discord embed
 deno task wiring        # offline grammY routing test (no Telegram calls)
-deno task shopee        # offline: Shopee wire contract — host, headers, one POST, every outcome
 deno task smoke         # store encryption round-trip + live API error branches
 deno task deploycheck   # offline pre-flight for the Deno Deploy shape (+ live probes
                         #  when PUBLIC_URL is in .env)

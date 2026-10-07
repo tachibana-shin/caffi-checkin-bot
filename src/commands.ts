@@ -1,6 +1,5 @@
 import type { CaffiError, LoginResult } from "./caffi.ts";
 import { apiFor, runCheckIn, vnDate } from "./checkin.ts";
-import { runShopeeCheckIn, shopeeStatusCard } from "./shopee.ts";
 import { store } from "./store.ts";
 import type { Sender } from "./telegram.ts";
 import type {
@@ -29,7 +28,6 @@ import type {
   ReminderList,
   SecurityStatus,
   ShareOther,
-  ShopeeAccount,
   UserRank,
   UserStats,
   Wallet,
@@ -171,20 +169,6 @@ function dispatch(ctx: Ctx, cmd: string, args: string[]): Promise<void> {
     case "logout":
       return doLogout(ctx, args[0]);
 
-    // Shopee: a second, unrelated provider — a pasted browser cookie instead of
-    // a login, and its own 00:00 run. Kept under one prefix so the two never
-    // have to share a noun (Caffi's /login stays Caffi's).
-    case "shopee":
-      return doShopee(ctx, args[0]);
-    case "shopee-login":
-      return doShopeeLogin(ctx, args);
-    case "shopee-checkin":
-      return doShopeeCheckIn(ctx, args[0]);
-    case "shopee-del":
-      return doShopeeDel(ctx, args[0]);
-    case "shopee-auto":
-      return doShopeeAuto(ctx, args);
-
     default:
       return reply(ctx, {
         icon: "🤔",
@@ -232,10 +216,6 @@ const NAV_SCREENS = new Map<string, string>([
   ["Chi tiết deal", "deals"],
   ["Đã lưu & nhắc mua", "saved"],
   ["Sàn hoàn tiền", "shops"],
-  // Shopee
-  ["Shopee Xu — điểm danh", "shopee"],
-  ["Đã điểm danh Shopee", "shopee"],
-  ["Hôm nay đã điểm danh Shopee", "shopee"],
 ]);
 
 function hint(title: string, body: string): Card {
@@ -292,16 +272,6 @@ export function helpCard(): Card {
       {
         heading: "⏰ Hành động",
         text: "/checkin — điểm danh ngay (không cần chờ 00:00)",
-      },
-      {
-        heading: "🪙 Shopee — điểm danh nhận Xu",
-        text: [
-          "/shopee-login <tên> <cookie> — dán cookie trình duyệt đã đăng nhập",
-          "/shopee [tên] — trạng thái điểm danh Shopee",
-          "/shopee-checkin [tên] — điểm danh ngay",
-          "/shopee-auto on|off [tên] · /shopee-del <tên]",
-          "Tự động 00:00 hằng ngày · giờ Việt Nam",
-        ].join("\n"),
       },
     ],
     footer: "🔒 Phiên bị server đá → bot nhắn báo bạn đăng nhập lại.",
@@ -1799,7 +1769,7 @@ export interface AccountSummary {
   error?: string;
 }
 
-export function allCard(rows: AccountSummary[], shopee: ShopeeSummary[] = []): Card {
+export function allCard(rows: AccountSummary[]): Card {
   const table = grid([
     ["", "Tài khoản", "Nay", "Chuỗi", "Hạng", "Xèng", "Auto"],
     ...rows.map((r) => [
@@ -1814,8 +1784,7 @@ export function allCard(rows: AccountSummary[], shopee: ShopeeSummary[] = []): C
   ]);
 
   const broken = rows.filter((r) => r.error);
-  const blocks: NonNullable<Card["blocks"]> = [];
-  if (rows.length) blocks.push({ mono: true, text: table });
+  const blocks: NonNullable<Card["blocks"]> = [{ mono: true, text: table }];
   if (broken.length) {
     blocks.push({
       heading: "Chưa đọc được",
@@ -1823,67 +1792,26 @@ export function allCard(rows: AccountSummary[], shopee: ShopeeSummary[] = []): C
     });
   }
 
-  // A different provider with a different identity — kept in its own table
-  // rather than squeezed into the Caffi columns, which mean nothing there.
-  const shopeeBroken = shopee.filter((s) => s.error || s.sessionInvalid);
-  if (shopee.length) {
-    blocks.push({
-      heading: "Shopee",
-      mono: true,
-      text: grid([
-        ["", "Phiên", "Nay", "Xu", "Auto"],
-        ...shopee.map((s) => [
-          "",
-          trunc(s.name, 26),
-          s.error ? "❌" : s.sessionInvalid ? "🔒" : s.checkedIn ? "✅" : "—",
-          s.todayCoins !== undefined ? num(s.todayCoins) : "—",
-          s.auto ? "on" : "off",
-        ]),
-      ]),
-    });
-  }
-  if (shopeeBroken.length) {
-    blocks.push({
-      heading: "Shopee cần làm lại",
-      text: shopeeBroken
-        .map((s) => `${trunc(s.name, 30)} — ${trunc(s.error ?? "cookie hết hạn", 70)}`)
-        .join("\n"),
-    });
-  }
-
   return {
     icon: "👥",
     title: "Tất cả tài khoản",
     subtitle: "Mỗi dòng là một login trong chat này",
-    tone: broken.length || shopeeBroken.length ? "warn" : "success",
+    tone: broken.length ? "warn" : "success",
     stats: [
       { label: "Tài khoản", value: num(rows.length) },
       { label: "Điểm danh hôm nay", value: num(rows.filter((r) => r.checkedIn).length) },
       { label: "Tự bật", value: num(rows.filter((r) => r.auto).length) },
       { label: "Hết phiên", value: num(rows.filter((r) => r.sessionInvalid).length) },
-      { label: "Shopee", value: num(shopee.length) },
-      { label: "Shopee hôm nay", value: num(shopee.filter((s) => s.checkedIn).length) },
     ],
     blocks,
     footer: "Chỉ đọc · /use <tên> để đổi · /auto on|off [tên] để bật/tắt.",
   };
 }
 
-/** One Shopee session in the `/all` roll-up. */
-export interface ShopeeSummary {
-  name: string;
-  auto: boolean;
-  sessionInvalid: boolean;
-  checkedIn?: boolean;
-  todayCoins?: number;
-  error?: string;
-}
-
 async function doAll(ctx: Ctx): Promise<void> {
   const chat = store.chat(ctx.chatId);
   const list = Object.values(chat.accounts);
-  const shopeeList = Object.values(store.shopeeChat(ctx.chatId));
-  if (!list.length && !shopeeList.length) return noAccountReply(ctx);
+  if (!list.length) return noAccountReply(ctx);
 
   const rows = await Promise.all(
     list.map(async (a): Promise<AccountSummary> => {
@@ -1915,28 +1843,7 @@ async function doAll(ctx: Ctx): Promise<void> {
     }),
   );
 
-  // Shopee is one read-only GET per session (settings), same idea as above.
-  const shopeeRows = await Promise.all(
-    shopeeList.map(async (s): Promise<ShopeeSummary> => {
-      const base = { name: s.name, auto: s.autoCheckIn, sessionInvalid: s.sessionInvalid };
-      if (s.sessionInvalid) return base;
-      try {
-        const card = await shopeeStatusCard(s);
-        const stats = new Map((card.stats ?? []).map((x) => [x.label, x.value]));
-        if (card.tone === "error") return { ...base, error: card.blocks?.at(-1)?.text ?? "Lỗi" };
-        return {
-          ...base,
-          checkedIn: stats.get("Hôm nay")?.startsWith("✅") === true,
-          todayCoins: Number((stats.get("Thưởng hôm nay") ?? "").replace(/\D/g, "")) || undefined,
-        };
-      } catch (e) {
-        return { ...base, error: (e as Error).message };
-      }
-    }),
-  );
-
-  await store.flush();
-  return reply(ctx, allCard(rows, shopeeRows), accountKeys(chat));
+  return reply(ctx, allCard(rows), accountKeys(chat));
 }
 
 /** Pure, so `/accounts` can be rendered (and tested) without touching the network. */
@@ -2062,192 +1969,6 @@ function doLogout(ctx: Ctx, username?: string): Promise<void> {
     subtitle: target,
     tone: "info",
     footer: "Token và mật khẩu đã bị xoá khỏi bộ nhớ của bot.",
-  });
-}
-
-// ── Shopee ─────────────────────────────────────────────────────────────────
-//
-// A separate provider with a separate identity: no password, no OTP, no token
-// exchange — the whole credential is a cookie string pasted out of a browser
-// that is already signed in to shopee.vn. See src/shopee.ts for the endpoints.
-
-/** Buttons on the Shopee screens. `nav:shopee-auto` with no action shows state. */
-export const SHOPEE_KEYS: KeyRows = [
-  [
-    { label: "Điểm danh ngay", data: "nav:shopee-checkin" },
-    { label: "Làm mới", data: "nav:shopee" },
-  ],
-  [{ label: "Auto on|off", data: "nav:shopee-auto" }],
-];
-
-function shopeeCookieHint(): NonNullable<Card["blocks"]> {
-  return [{
-    heading: "Cách lấy cookie",
-    text: [
-      "1. Mở shopee.vn trong trình duyệt ĐÃ đăng nhập",
-      "2. F12 → Application → Cookies → shopee.vn",
-      "3. Copy toàn bộ, dán vào:",
-      "/shopee-login ten SPC_...=...; SPC_...=...",
-      "",
-      "Bot chỉ dùng cookie này cho điểm danh, không gọi API khác.",
-    ].join("\n"),
-    mono: true,
-  }];
-}
-
-function noShopeeReply(ctx: Ctx, name?: string): Promise<void> {
-  const all = store.shopeeChat(ctx.chatId);
-  const names = Object.keys(all);
-  if (names.length) {
-    return reply(ctx, {
-      icon: "🪙",
-      title: name ? "Không có phiên Shopee này" : "Chưa chọn phiên Shopee",
-      subtitle: name ?? names.join(", "),
-      tone: "warn",
-      blocks: [{ text: `Gõ /shopee để xem ${names.length} phiên đang có trong chat này.` }],
-    }, SHOPEE_KEYS);
-  }
-  return reply(ctx, {
-    icon: "🪙",
-    title: "Chưa có phiên Shopee nào",
-    subtitle: "Điểm danh Shopee Xu",
-    tone: "warn",
-    blocks: shopeeCookieHint(),
-  });
-}
-
-/** /shopee-login <tên> <cookie…> — save (or replace) one web session. */
-async function doShopeeLogin(ctx: Ctx, args: string[]): Promise<void> {
-  const name = args[0]?.trim();
-  const cookie = args.slice(1).join(" ").trim();
-  if (!name || !cookie) {
-    return reply(ctx, {
-      icon: "🪙",
-      title: "Thiếu cookie Shopee",
-      tone: "warn",
-      blocks: [{
-        text: "/shopee-login <tên> <cookie>\n\nCookie lấy từ trình duyệt đã đăng nhập shopee.vn.",
-        mono: true,
-      }, ...shopeeCookieHint()],
-    });
-  }
-
-  const chat = store.shopeeChat(ctx.chatId);
-  const prev = chat[name];
-  // Everything except the credential survives a re-paste, so a refreshed
-  // cookie does not silently turn auto check-in off or forget the streak.
-  const account: ShopeeAccount = {
-    name,
-    cookie,
-    userid: prev?.userid,
-    autoCheckIn: prev?.autoCheckIn ?? true,
-    sessionInvalid: false,
-    lastCheckInDay: prev?.lastCheckInDay,
-    lastCheckInResult: prev?.lastCheckInResult,
-    lastResultDay: prev?.lastResultDay,
-    lastInvalidRemindAt: prev?.lastInvalidRemindAt,
-    createdAt: prev?.createdAt ?? new Date().toISOString(),
-  };
-  chat[name] = account;
-  store.touch();
-  await store.flush();
-
-  // Verify immediately: a truncated paste should fail here, not at midnight.
-  const card = await shopeeStatusCard(account);
-  await store.flush();
-
-  if (card.tone === "error") {
-    return reply(ctx, {
-      ...card,
-      subtitle: name,
-      blocks: [
-        { text: "Cookie đã lưu nhưng chưa dùng được — kiểm tra lại đoạn copy." },
-        ...(card.blocks ?? []),
-      ],
-    });
-  }
-  return reply(ctx, {
-    icon: "🪙",
-    title: prev ? "Đã cập nhật cookie Shopee" : "Đã lưu phiên Shopee",
-    subtitle: name,
-    tone: "success",
-    stats: card.stats,
-    blocks: [{ text: "Tự điểm danh 00:00 hằng ngày · /shopee-checkin để điểm danh ngay." }],
-    footer: card.footer,
-  });
-}
-
-/** /shopee [tên] — GET settings, nothing else. */
-async function doShopee(ctx: Ctx, name?: string): Promise<void> {
-  const account = store.resolveShopee(ctx.chatId, name);
-  if (!account) return noShopeeReply(ctx, name);
-  const card = await shopeeStatusCard(account);
-  await store.flush();
-  return reply(ctx, card, SHOPEE_KEYS);
-}
-
-/** /shopee-checkin [tên] — the check-in, now, outside the schedule. */
-async function doShopeeCheckIn(ctx: Ctx, name?: string): Promise<void> {
-  const account = store.resolveShopee(ctx.chatId, name);
-  if (!account) return noShopeeReply(ctx, name);
-
-  await reply(ctx, {
-    icon: "⏳",
-    title: "Đang điểm danh Shopee…",
-    subtitle: account.name,
-    tone: "info",
-    progress: true,
-  });
-
-  const r = await runShopeeCheckIn(account);
-  await store.flush();
-  return reply(ctx, r.card, SHOPEE_KEYS);
-}
-
-function doShopeeDel(ctx: Ctx, name?: string): Promise<void> {
-  const chat = store.shopeeChat(ctx.chatId);
-  const names = Object.keys(chat);
-  const target = name ?? (names.length === 1 ? names[0] : undefined);
-  if (!target || !chat[target]) return noShopeeReply(ctx, name);
-
-  delete chat[target];
-  store.touch();
-  return reply(ctx, {
-    icon: "🗑",
-    title: "Đã xoá phiên Shopee",
-    subtitle: target,
-    tone: "info",
-    footer: "Cookie đã bị xoá khỏi bộ nhớ của bot.",
-  });
-}
-
-function doShopeeAuto(ctx: Ctx, args: string[]): Promise<void> {
-  const action = args.find((w) => w === "on" || w === "off");
-  const named = args.find((w) => w !== "on" && w !== "off");
-  const account = store.resolveShopee(ctx.chatId, named);
-  if (!account) return noShopeeReply(ctx, named);
-
-  if (action === undefined) {
-    return reply(ctx, {
-      icon: "⏰",
-      title: "Tự động điểm danh Shopee",
-      subtitle: `${account.name} · hiện: ${account.autoCheckIn ? "BẬT" : "TẮT"}`,
-      tone: "info",
-      blocks: [{
-        text: "Đổi bằng /shopee-auto on hoặc /shopee-auto off — thêm tên nếu chat có nhiều phiên.",
-      }],
-    }, SHOPEE_KEYS);
-  }
-
-  account.autoCheckIn = action === "on";
-  store.touch();
-  return reply(ctx, {
-    icon: account.autoCheckIn ? "⏰" : "⏸",
-    title: account.autoCheckIn
-      ? "Đã bật tự động điểm danh Shopee"
-      : "Đã tắt tự động điểm danh Shopee",
-    subtitle: `${account.name} · 00:00 giờ VN`,
-    tone: account.autoCheckIn ? "success" : "warn",
   });
 }
 

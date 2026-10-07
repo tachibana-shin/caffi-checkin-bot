@@ -63,7 +63,7 @@ type DiscordInteraction = SetupDesiredProps<
 >;
 
 /** Commands that handle credentials — offered in DMs only, never in a server. */
-const AUTH_ONLY = new Set(["login", "otp", "resend", "cancel", "shopee-login"]);
+const AUTH_ONLY = new Set(["login", "otp", "resend", "cancel"]);
 
 function option(
   name: string,
@@ -82,16 +82,11 @@ function accountOption() {
   return option("tai_khoan", "Tên tài khoản trong chat — bỏ trống để lấy tài khoản đang dùng");
 }
 
-/** The optional `<tên phiên>` argument, for the Shopee commands. */
-function shopeeOption() {
-  return option("phien", "Tên phiên Shopee — bỏ trống nếu chat chỉ có một");
-}
-
 /**
  * The slash-command list. Restarting the bot pushes it to Discord; global
  * commands can take up to an hour to appear.
  */
-export const COMMANDS: CreateApplicationCommand[] = [
+const COMMANDS: CreateApplicationCommand[] = [
   { name: "start", description: "Bắt đầu với bot" },
   { name: "help", description: "Danh sách lệnh" },
   {
@@ -207,37 +202,6 @@ export const COMMANDS: CreateApplicationCommand[] = [
     name: "cancel",
     description: "Huỷ phiên đăng nhập đang chờ (chỉ dùng trong tin nhắn riêng)",
     contexts: [DiscordInteractionContextType.BotDm],
-  },
-
-  // ── Shopee ──
-  {
-    name: "shopee",
-    description: "Trạng thái điểm danh Shopee (chỉ đọc)",
-    options: [shopeeOption()],
-  },
-  {
-    name: "shopee-checkin",
-    description: "Điểm danh Shopee ngay",
-    options: [shopeeOption()],
-  },
-  {
-    name: "shopee-auto",
-    description: "Bật/tắt tự động điểm danh Shopee",
-    options: [option("trang_thai", "on hoặc off"), shopeeOption()],
-  },
-  {
-    name: "shopee-del",
-    description: "Xoá phiên Shopee khỏi bot",
-    options: [shopeeOption()],
-  },
-  {
-    name: "shopee-login",
-    description: "Dán cookie Shopee từ trình duyệt (chỉ dùng trong tin nhắn riêng)",
-    contexts: [DiscordInteractionContextType.BotDm],
-    options: [
-      option("ten", "Tên phiên Shopee", true),
-      option("cookie", "Cookie shopee.vn đã đăng nhập", true),
-    ],
   },
 ];
 

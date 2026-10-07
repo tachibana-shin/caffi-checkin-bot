@@ -22,33 +22,6 @@ export interface Account {
   createdAt: string;
 }
 
-/**
- * A Shopee **web** session. Shopee has no app-token login, so the whole
- * credential is the `Cookie` header of a browser that is already signed in to
- * shopee.vn — see `src/shopee.ts` for where it is spent.
- */
-export interface ShopeeAccount {
-  /** Short label the commands use; the cookie carries the real identity. */
-  name: string;
-  /** Raw cookie string copied from DevTools (`SPC_...=...; SPC_...=...`). */
-  cookie: string;
-  /** `userid` from GET settings, once a session has been seen to work. */
-  userid?: string;
-  /** Per-account auto check-in switch. Defaults to true. */
-  autoCheckIn: boolean;
-  /** The API answered 401 — the cookie expired, the user must paste a new one. */
-  sessionInvalid: boolean;
-  invalidReason?: string;
-  /** VN date our own POST was actually credited for. */
-  lastCheckInDay?: string;
-  lastCheckInResult?: string;
-  /** VN date `lastCheckInResult` belongs to — dedups a repeated message. */
-  lastResultDay?: string;
-  /** Epoch ms of the last "cookie expired" reminder (anti-spam). */
-  lastInvalidRemindAt?: number;
-  createdAt: string;
-}
-
 export interface PendingLogin {
   username: string;
   password: string;
@@ -61,8 +34,6 @@ export interface PendingLogin {
 export interface ChatState {
   activeAccount?: string;
   accounts: Record<string, Account>;
-  /** Shopee sessions held by this chat, keyed by name. Omit until one is added. */
-  shopeeAccounts?: Record<string, ShopeeAccount>;
   pending?: PendingLogin;
   /** Which screen is open — lets the "Làm mới" button know what to redraw. */
   lastNav?: string;
@@ -77,8 +48,6 @@ export interface StoreData {
   lastAutoRunDate?: string;
   /** VN date the automatic run last *finished* — lets a catch-up retry a crash. */
   lastAutoRunDoneDate?: string;
-  /** VN date the Shopee run was last *started* — stops a double fire per window. */
-  lastShopeeRunDate?: string;
 }
 
 /**
