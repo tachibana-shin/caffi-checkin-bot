@@ -1,5 +1,11 @@
 # Caffi Auto Check-in Bot
 
+**Source:**
+[github.com/tachibana-shin/caffi-checkin-bot](https://github.com/tachibana-shin/caffi-checkin-bot) ·
+**Live:**
+[caffi-checkin-bot.tachibana-shin.deno.net](https://caffi-checkin-bot.tachibana-shin.deno.net) ·
+**License:** [GNU GPL v3.0](LICENSE)
+
 A Telegram **and** Discord bot that logs into the **Caffi** app (`vn.caffiliate.customer`) with a
 username/password + OTP and performs the daily check-in at **00:00 (midnight) Vietnam time**. When
 the server drops the session, the bot messages you to log in again.
@@ -323,3 +329,12 @@ CAFFI_USER=... CAFFI_PASS=... deno run -A scripts/test-login.ts verify 123456
 deno run -A scripts/test-session.ts            # read-only
 deno run -A scripts/test-session.ts checkin    # performs the check-in
 ```
+
+## License
+
+[GNU General Public License v3.0](LICENSE) — the full text is in [`LICENSE`](LICENSE), its SPDX
+identifier is `GPL-3.0-only`.
+
+You are free to run, study, share and modify this program. Anything you distribute based on it must
+carry the same licence and its source must stay available — that is the whole point of copy-left:
+the bot that starts checking people in keeps the code that does it open too.

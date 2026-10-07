@@ -1,6 +1,7 @@
 {
   "name": "caffi-checkin-bot",
   "version": "1.0.0",
+  "license": "GPL-3.0-only",
   "exports": "./src/main.ts",
   "unstable": ["kv", "cron"],
   "tasks": {
