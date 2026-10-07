@@ -155,10 +155,10 @@ openssl rand -hex 32
 3. Restart. On start-up the bot pushes its slash commands globally; Discord can take up to an hour
    to show them the first time.
 4. Only for the webhook shape (Deno Deploy): copy **General Information → Public Key** into
-   `DISCORD_PUBLIC_KEY` and set **Interactions Endpoint URL** to `PUBLIC_URL/discord`. Discord
-   signs a PING with that public key and wants its `challenge` echoed back — when the handshake
-   fails the slash commands stay dead while everything else still looks fine, so it is worth
-   checking the logs for `[discord] ping from Discord`.
+   `DISCORD_PUBLIC_KEY` and set **Interactions Endpoint URL** to `PUBLIC_URL/discord`. Discord signs
+   a PING with that public key and wants its `challenge` echoed back — when the handshake fails the
+   slash commands stay dead while everything else still looks fine, so it is worth checking the logs
+   for `[discord] ping from Discord`.
 
 With `DISCORD_TOKEN` empty the Discord side is skipped entirely.
 
@@ -169,8 +169,8 @@ deno task logo   # name, description and short description on Telegram + the Dis
 ```
 
 Everything comes from `assets/logo.png`, the icon lifted out of the APK. The picture itself has to
-be set by hand on Telegram: the Bot API has no call for a bot's own photo, so send
-`assets/logo.png` to @BotFather and run `/setuserpic` there.
+be set by hand on Telegram: the Bot API has no call for a bot's own photo, so send `assets/logo.png`
+to @BotFather and run `/setuserpic` there.
 
 ## Using the bot
 
@@ -228,12 +228,12 @@ Each chat can hold **several accounts**; switch the active one with `/use <name>
 Deno Deploy has no writable filesystem and no single long-lived process, so there the bot runs
 `RUNTIME_MODE=webhook` (`src/main.ts`):
 
-|             | local (`deno task start`)                        | Deno Deploy                                                |
-| ----------- | ------------------------------------------------ | ----------------------------------------------------------- |
-| Telegram    | grammY long polling                              | `POST /telegram`, `X-Telegram-Bot-Api-Secret-Token` checked |
-| Discord     | gateway                                          | `POST /discord`, Ed25519 over `timestamp + body`            |
-| state       | `data/store.kv` (`store.json` before that)       | Deno KV, one record under `["caffi", "store"]`              |
-| schedule    | timers in `src/scheduler.ts`                     | two `Deno.cron` jobs from `src/cron.ts`                     |
+|          | local (`deno task start`)                  | Deno Deploy                                                 |
+| -------- | ------------------------------------------ | ----------------------------------------------------------- |
+| Telegram | grammY long polling                        | `POST /telegram`, `X-Telegram-Bot-Api-Secret-Token` checked |
+| Discord  | gateway                                    | `POST /discord`, Ed25519 over `timestamp + body`            |
+| state    | `data/store.kv` (`store.json` before that) | Deno KV, one record under `["caffi", "store"]`              |
+| schedule | timers in `src/scheduler.ts`               | two `Deno.cron` jobs from `src/cron.ts`                     |
 
 The handler still naps to the exact second (`msUntilWindow`), so the cron only has to wake an
 isolate at the right minute: `caffi-checkin-pre-roll` at `59 16 * * *` UTC (23:59 VN) and
@@ -264,12 +264,11 @@ deno deploy database assign <db> --org <org> --app <app>
 deno deploy --prod --non-interactive --org <org> --app <app> .
 ```
 
-Without step 2 the first boot dies with *"no KV database is attached to this app"*.
+Without step 2 the first boot dies with _"no KV database is attached to this app"_.
 
-**Bringing the accounts over.** There is no `data/store.json` on Deno Deploy, so the KV starts
-empty and every account has to be logged in again. To keep the ones you already have, hand the
-file over as an env var — it is still sealed with `BOT_SECRET`, so the platform only ever stores
-ciphertext:
+**Bringing the accounts over.** There is no `data/store.json` on Deno Deploy, so the KV starts empty
+and every account has to be logged in again. To keep the ones you already have, hand the file over
+as an env var — it is still sealed with `BOT_SECRET`, so the platform only ever stores ciphertext:
 
 ```bash
 deno deploy env add --secret STORE_IMPORT "$(tr -d '\n' < data/store.json)" \

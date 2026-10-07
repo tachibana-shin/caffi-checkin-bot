@@ -263,7 +263,10 @@ if (raw === null) {
 // A host with no file to migrate from (Deno Deploy) is handed the old
 // `store.json` through an env var instead. That branch only exists when
 // `config.deploy` is true, and config.ts reads the environment when it is
-// imported — so it needs a process of its own.
+// imported — so it needs a process of its own. That process opens the
+// *platform* KV, which on a plain `deno run` is the per-location database
+// under `$DENO_DIR` — left alone it would still hold the previous run's seed
+// and this check would pass once and fail forever after.
 const seedPayload = await seal({ version: 1, chats: { "ds:42": { accounts: {} } } }, config.secret);
 const seedScript = `${TMP}/seed.ts`;
 await Deno.writeTextFile(
@@ -277,12 +280,15 @@ await Deno.writeTextFile(
     "",
   ].join("\n"),
 );
+// The seed directory doubles as that DENO_DIR, so it has to go before every run.
+await Deno.remove(`${TMP}-seed`, { recursive: true }).catch(() => {});
 const seed = await new Deno.Command(Deno.execPath(), {
   args: ["run", "-A", "--config", new URL("../deno.json", import.meta.url).pathname, seedScript],
   env: {
     DENO_DEPLOY: "true",
     RUNTIME_MODE: "webhook",
     DATA_DIR: `${TMP}-seed`,
+    DENO_DIR: `${TMP}-seed/deno`,
     STORE_IMPORT: JSON.stringify({ payload: seedPayload }),
   },
   stdout: "piped",
