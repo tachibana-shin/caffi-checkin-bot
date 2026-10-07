@@ -187,6 +187,101 @@ check(
   sent.some((s) => s.text.includes("Tất cả tài khoản") && s.text.includes("y@test")),
 );
 
+// ── Shopee: a second provider sharing the same router ─────────────────────
+
+sent.length = 0;
+await bot.handleUpdate(update("/help") as never);
+check(
+  "/help advertises the Shopee commands",
+  ["/shopee-login", "/shopee ", "/shopee-checkin", "/shopee-auto", "/shopee-del"].every((c) =>
+    sent[0]?.text.includes(c)
+  ),
+  sent[0]?.text.slice(0, 40),
+);
+
+sent.length = 0;
+await bot.handleUpdate(update("/shopee") as never);
+check(
+  "/shopee with no session -> asks for a cookie",
+  sent[0]?.text.includes("shopee-login") === true,
+  sent[0]?.text.slice(0, 60),
+);
+
+sent.length = 0;
+await bot.handleUpdate(update("/shopee-login") as never);
+check(
+  "/shopee-login without args -> usage",
+  sent[0]?.text.includes("Thiếu cookie Shopee") === true,
+);
+
+sent.length = 0;
+await bot.handleUpdate(update("/shopee-auto off") as never);
+check(
+  "/shopee-auto with no session -> asks for a cookie",
+  sent[0]?.text.includes("Chưa có phiên Shopee nào") === true,
+);
+
+// Seed one (already dead) so the rest of the routing never touches the network.
+const shopeeAccounts = store.shopeeChat(999);
+shopeeAccounts["shopee-main"] = {
+  name: "shopee-main",
+  cookie: "SPC_F=x; SPC_ST=y",
+  autoCheckIn: true,
+  sessionInvalid: true,
+  invalidReason: "Unauthorization with sso",
+  createdAt: "2026-10-01T00:00:00.000Z",
+};
+store.touch();
+
+sent.length = 0;
+await bot.handleUpdate(update("/shopee-auto") as never);
+check(
+  "/shopee-auto without an action shows the state",
+  sent[0]?.text.includes("shopee-main") === true && sent[0]?.text.includes("BẬT") === true,
+  sent[0]?.text.slice(0, 60),
+);
+
+sent.length = 0;
+await bot.handleUpdate(update("/shopee-auto off") as never);
+check(
+  "/shopee-auto off toggles the session",
+  shopeeAccounts["shopee-main"]?.autoCheckIn === false,
+);
+
+sent.length = 0;
+await bot.handleUpdate(update("/shopee-del khac") as never);
+check(
+  "/shopee-del <tên lạ> reports the unknown session",
+  sent[0]?.text.includes("Không có phiên Shopee này") === true,
+);
+
+sent.length = 0;
+await bot.handleUpdate(update("/shopee-del") as never);
+check(
+  "/shopee-del removes the only session",
+  Object.keys(store.shopeeChat(999)).length === 0,
+);
+
+// A chat that holds nothing but a Shopee cookie must still be able to /all.
+const only = store.shopeeChat(777);
+only["s1"] = {
+  name: "s1",
+  cookie: "SPC_F=z",
+  autoCheckIn: true,
+  sessionInvalid: true,
+  invalidReason: "Unauthorization with sso",
+  createdAt: "2026-10-01T00:00:00.000Z",
+};
+store.touch();
+
+sent.length = 0;
+await handleNav({ tg, chatId: 777, userId: 777, raw: "" }, "nav:all");
+check(
+  "/all renders a Shopee-only chat without asking for /login",
+  sent.some((s) => s.text.includes("Tất cả tài khoản") && s.text.includes("s1")),
+  sent[0]?.text.slice(0, 80),
+);
+
 console.log("\nescapeHtml:", escapeHtml(`<&>"`));
 console.log(failed ? `${failed} FAILED` : "all wiring OK");
 Deno.exit(failed ? 1 : 0);

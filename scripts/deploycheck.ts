@@ -7,11 +7,13 @@
  *   deno task deploycheck
  *
  * Sections: environment, `config.ts` vs `.env.example`, schedule arithmetic,
- * Deno KV, Telegram's webhook callback, Discord's interactions endpoint and —
- * when PUBLIC_URL is set — a live check against the deployed app.
+ * Deno KV, the Shopee wire contract, Telegram's webhook callback, Discord's
+ * interactions endpoint and — when PUBLIC_URL is set — a live check against
+ * the deployed app.
  *
- * Nothing here talks to Caffi, and no request ever leaves the process: both
- * bots are built with a fake `botInfo` and every answer comes from a stub.
+ * Nothing here talks to Caffi or to Shopee, and no request ever leaves the
+ * process: both bots are built with a fake `botInfo` and every answer comes
+ * from a stub.
  */
 Deno.env.set("RUNTIME_MODE", "webhook"); // the deployed shape, whatever .env says
 // The checks write to KV, so keep them away from the real store.
@@ -95,9 +97,14 @@ Deno.env.set("DISCORD_PUBLIC_KEY", testPublicKey);
 // ── Imports (after the environment is final — config.ts reads it once) ─────
 
 const { config } = await import("../src/config.ts");
-const { preRollCronSpec, catchUpCronSpec, msUntilWindow, planRun } = await import(
-  "../src/scheduler.ts"
-);
+const {
+  preRollCronSpec,
+  catchUpCronSpec,
+  msUntilWindow,
+  planRun,
+  shopeeCronSpec,
+  shopeeCatchUpCronSpec,
+} = await import("../src/scheduler.ts");
 const { store } = await import("../src/store.ts");
 const { seal } = await import("../src/crypto.ts");
 
@@ -112,7 +119,7 @@ const { registerHandlers } = await import("../src/main.ts");
 console.log = realLog;
 
 const { senderFor, webhookHandler } = await import("../src/telegram.ts");
-const { createDiscordBot, interactionHandler } = await import("../src/discord.ts");
+const { COMMANDS, createDiscordBot, interactionHandler } = await import("../src/discord.ts");
 const { Bot } = await import("grammy");
 
 // ── Schedule ───────────────────────────────────────────────────────────────
@@ -219,8 +226,9 @@ check(
 
 const cronLog = cronLines.find((l) => l.includes("Cron:")) ?? "";
 check(
-  "main.ts registers both Deno.cron jobs",
-  typeof Deno.cron === "function" && /pre-roll/.test(cronLog) && /catch-up/.test(cronLog),
+  "main.ts registers all four Deno.cron jobs",
+  typeof Deno.cron === "function" &&
+    ["(pre-roll)", "(catch-up)", "(shopee)", "(shopee catch-up)"].every((k) => cronLog.includes(k)),
   cronLog.replace("⏰ ", ""),
 );
 
@@ -263,7 +271,10 @@ if (raw === null) {
 // A host with no file to migrate from (Deno Deploy) is handed the old
 // `store.json` through an env var instead. That branch only exists when
 // `config.deploy` is true, and config.ts reads the environment when it is
-// imported — so it needs a process of its own.
+// imported — so it needs a process of its own. That process opens the
+// *platform* KV, which on a plain `deno run` is the per-location database
+// under `$DENO_DIR` — left alone it would still hold the previous run's seed
+// and this check would pass once and fail forever after.
 const seedPayload = await seal({ version: 1, chats: { "ds:42": { accounts: {} } } }, config.secret);
 const seedScript = `${TMP}/seed.ts`;
 await Deno.writeTextFile(
@@ -277,12 +288,15 @@ await Deno.writeTextFile(
     "",
   ].join("\n"),
 );
+// The seed directory doubles as that DENO_DIR, so it has to go before every run.
+await Deno.remove(`${TMP}-seed`, { recursive: true }).catch(() => {});
 const seed = await new Deno.Command(Deno.execPath(), {
   args: ["run", "-A", "--config", new URL("../deno.json", import.meta.url).pathname, seedScript],
   env: {
     DENO_DEPLOY: "true",
     RUNTIME_MODE: "webhook",
     DATA_DIR: `${TMP}-seed`,
+    DENO_DIR: `${TMP}-seed/deno`,
     STORE_IMPORT: JSON.stringify({ payload: seedPayload }),
   },
   stdout: "piped",
@@ -296,6 +310,139 @@ check(
     ? seedOut.match(/seeded=[^\n]*/)?.[0] ?? ""
     : `exit ${seed.code}: ${seedOut.trim().split("\n").pop()}`,
 );
+
+// ── Shopee ────────────────────────────────────────────────────────────────
+
+section("Shopee check-in (second provider)");
+
+const shopeeSpec = shopeeCronSpec();
+const shopeeCatchSpec = shopeeCatchUpCronSpec();
+check("shopee cron spec is valid", parseSpec(shopeeSpec) !== undefined, shopeeSpec);
+check("shopee catch-up spec is valid", parseSpec(shopeeCatchSpec) !== undefined, shopeeCatchSpec);
+check("shopee fires exactly at 00:00 VN", firesAt(shopeeSpec) === 0, hhmmss(firesAt(shopeeSpec)));
+check(
+  "shopee catch-up fires exactly at 00:30 VN",
+  firesAt(shopeeCatchSpec) === 30 * 60,
+  hhmmss(firesAt(shopeeCatchSpec)),
+);
+check(
+  "all four jobs land on different minutes",
+  new Set([preRoll, catchUp, shopeeSpec, shopeeCatchSpec]).size === 4,
+  [preRoll, catchUp, shopeeSpec, shopeeCatchSpec].join(" · "),
+);
+
+// The cookie is the whole credential, so its command must never reach a guild.
+const shopeeCmds = COMMANDS.filter((c) => c.name.startsWith("shopee"));
+check(
+  "Discord exposes all five Shopee commands",
+  shopeeCmds.length === 5,
+  shopeeCmds.map((c) => c.name).join(", "),
+);
+check(
+  "shopee-login is restricted to DMs",
+  (shopeeCmds.find((c) => c.name === "shopee-login")?.contexts ?? []).length === 1,
+);
+
+// The wire contract, offline: stub fetch and drive one day through the runner.
+// Same idea as `deno task shopee`, trimmed to what a bad deploy would break.
+const { runShopeeCheckIn, shopeeSettings } = await import("../src/shopee.ts");
+const realFetch = globalThis.fetch;
+const wire: { url: string; method: string; headers: Record<string, string> }[] = [];
+const replies: { match: string; body: unknown }[] = [
+  {
+    match: "settings",
+    body: {
+      code: 0,
+      msg: "success",
+      data: {
+        login: true,
+        userid: "4242",
+        checked_in_today: false,
+        checked_in_today_amount: 100,
+        checkin_list: [100, 100, 100, 100, 100, 100, 100, 100],
+        today_index: 1,
+      },
+    },
+  },
+  {
+    match: "checkin_new",
+    body: {
+      code: 0,
+      msg: "success",
+      data: {
+        success: true,
+        increase_coins: 100,
+        today_index: 1,
+        checkin_list: [100, 100, 100, 100, 100, 100, 100, 100],
+      },
+    },
+  },
+];
+globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+  const url = String(input);
+  wire.push({ url, method: init?.method ?? "GET", headers: (init?.headers ?? {}) as never });
+  const hit = replies.find((r) => url.endsWith(r.match));
+  return Promise.resolve(new Response(JSON.stringify(hit?.body ?? {}), { status: 200 }));
+}) as typeof fetch;
+
+const shopeeAccount: import("../src/types.ts").ShopeeAccount = {
+  name: "deploycheck",
+  cookie: "SPC_F=1; SPC_ST=2",
+  autoCheckIn: true,
+  sessionInvalid: false,
+  createdAt: "2026-10-01T00:00:00.000Z",
+};
+
+try {
+  await shopeeSettings(shopeeAccount.cookie);
+  check(
+    "GET settings goes to games-dailycheckin.shopee.vn",
+    wire[0]?.url === "https://games-dailycheckin.shopee.vn/mkt/coins/api/v2/settings",
+    wire[0]?.url,
+  );
+
+  wire.length = 0;
+  const r = await runShopeeCheckIn(shopeeAccount);
+  check("a fresh day is credited", r.outcome === "checked_in", r.outcome);
+  check(
+    "…with dci-version and check-in-origin on every hop",
+    wire.length > 0 &&
+      wire.every((c) =>
+        c.headers["dci-version"] === "4008000" && c.headers["check-in-origin"] === "pc"
+      ),
+  );
+  check(
+    "…and exactly one write: POST checkin_new",
+    wire.filter((c) => c.method === "POST").length === 1 &&
+      wire.some((c) => c.method === "POST" && c.url.endsWith("checkin_new")),
+    wire.map((c) => `${c.method} ${c.url}`).join(" · "),
+  );
+  check(
+    "…carrying the cookie",
+    wire.every((c) => c.headers["cookie"] === shopeeAccount.cookie),
+  );
+  check(
+    "lastCheckInDay recorded, so the 00:30 catch-up stands down",
+    shopeeAccount.lastCheckInDay !== undefined,
+  );
+} finally {
+  globalThis.fetch = realFetch;
+}
+
+const shopeeChat = store.shopeeChat("deploycheck");
+shopeeChat["deploycheck"] = shopeeAccount;
+check(
+  "the store hands the session to the nightly run",
+  store.autoShopeeAccounts().some((x) => x.account.name === "deploycheck"),
+);
+shopeeAccount.sessionInvalid = true;
+check(
+  "…but not once the cookie is refused",
+  store.autoShopeeAccounts().every((x) => x.account.name !== "deploycheck") &&
+    store.invalidShopeeAccounts().some((x) => x.account.name === "deploycheck"),
+);
+delete shopeeChat["deploycheck"];
+shopeeAccount.sessionInvalid = false;
 
 // ── Telegram ───────────────────────────────────────────────────────────────
 

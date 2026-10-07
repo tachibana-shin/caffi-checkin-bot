@@ -13,6 +13,7 @@
     "timing": "deno run -A scripts/timing.ts",
     "view": "deno run -A scripts/view.ts",
     "wiring": "deno run -A scripts/wiring.ts",
+    "shopee": "deno run -A scripts/shopee.ts",
     "deploycheck": "deno run -A --env-file=.env scripts/deploycheck.ts",
     "logo": "deno run -A --env-file=.env scripts/logo.ts",
     "fmt": "deno fmt"
@@ -35,9 +36,3 @@
     "app": "caffi-checkin-bot"
   }
 }
-
-
-
-
-
-

@@ -1,7 +1,15 @@
 import { boot } from "./boot.ts";
 import { config } from "./config.ts";
 import { sleep } from "./checkin.ts";
-import { catchUpCronSpec, createRunner, msUntilWindow, preRollCronSpec } from "./scheduler.ts";
+import {
+  catchUpCronSpec,
+  createRunner,
+  msUntilWindow,
+  preRollCronSpec,
+  runShopeeDaily,
+  shopeeCatchUpCronSpec,
+  shopeeCronSpec,
+} from "./scheduler.ts";
 import { store } from "./store.ts";
 
 /**
@@ -11,8 +19,8 @@ import { store } from "./store.ts";
  * CLI only tracks cron jobs registered during start-up — both need this file
  * imported for its side effect, before anything awaits.
  *
- * The two jobs are in UTC because that is all cron speaks; Vietnam is UTC+7
- * all year, so `preRollCronSpec()` translates the local schedule once here.
+ * The jobs are in UTC because that is all cron speaks; Vietnam is UTC+7 all
+ * year, so the specs above translate the local schedule once here.
  */
 function registerCron(): void {
   Deno.cron(
@@ -39,7 +47,25 @@ function registerCron(): void {
     () => run(true),
   );
 
-  console.log(`⏰ Cron: ${preRollCronSpec()} (pre-roll) · ${catchUpCronSpec()} (catch-up) UTC`);
+  // Shopee: no nap and no race, so both jobs fire on the minute. The first is
+  // midnight; the second covers a day the server had not rolled over yet.
+  Deno.cron(
+    "shopee-checkin",
+    shopeeCronSpec(),
+    { backoffSchedule: [1000, 5000] },
+    () => runShopee(false),
+  );
+  Deno.cron(
+    "shopee-checkin-catch-up",
+    shopeeCatchUpCronSpec(),
+    { backoffSchedule: [1000, 5000] },
+    () => runShopee(true),
+  );
+
+  console.log(
+    `⏰ Cron: ${preRollCronSpec()} (pre-roll) · ${catchUpCronSpec()} (catch-up) UTC` +
+      ` · ${shopeeCronSpec()} (shopee) · ${shopeeCatchUpCronSpec()} (shopee catch-up)`,
+  );
 }
 
 async function run(force: boolean): Promise<void> {
@@ -49,6 +75,15 @@ async function run(force: boolean): Promise<void> {
     await store.flush();
   } catch (e) {
     console.error("[cron] run failed:", e);
+  }
+}
+
+async function runShopee(force: boolean): Promise<void> {
+  try {
+    const { fanOut } = await boot();
+    await runShopeeDaily(fanOut, force);
+  } catch (e) {
+    console.error("[cron] shopee run failed:", e);
   }
 }
 

@@ -13,7 +13,7 @@ Deno.env.set("TELEGRAM_BOT_TOKEN", "timing-test-token");
 Deno.env.set("BOT_SECRET", "timing-secret");
 Deno.env.set("DATA_DIR", "/tmp/opencode/caffi-timing");
 
-const { planRun } = await import("../src/scheduler.ts");
+const { planRun, shopeeCatchUpCronSpec, shopeeCronSpec } = await import("../src/scheduler.ts");
 const { checkedInAtOf, decideFromStatus, pollDelay, vnMidnightMs } = await import(
   "../src/checkin.ts"
 );
@@ -208,6 +208,19 @@ function secondsLeft(plan: ReturnType<typeof planRun>, now: Date): number | null
   );
   check("checkedInAtOf with no history -> undefined", checkedInAtOf({}) === undefined);
   check("checkedInAtOf with no history array -> undefined", checkedInAtOf(null) === undefined);
+}
+
+// ── Shopee: two jobs that fire *on* the minute, not the minute before ─────
+{
+  // Caffi's specs land one second early so `msUntilWindow` can nap into the
+  // exact second; Shopee has no race to win and must not nap past midnight.
+  check("shopee runs at 00:00 VN = 17:00 UTC", shopeeCronSpec() === "0 17 * * *", shopeeCronSpec());
+  check(
+    "shopee catch-up runs at 00:30 VN = 17:30 UTC",
+    shopeeCatchUpCronSpec() === "30 17 * * *",
+    shopeeCatchUpCronSpec(),
+  );
+  check("…neither is pulled a minute early", !shopeeCronSpec().startsWith("59"));
 }
 
 console.log(failed ? `\n${failed} check(s) FAILED` : "\nAll OK");

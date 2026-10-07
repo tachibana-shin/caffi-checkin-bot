@@ -1,6 +1,6 @@
 import { seal, unseal } from "./crypto.ts";
 import { config } from "./config.ts";
-import type { Account, ChatState, StoreData } from "./types.ts";
+import type { Account, ChatState, ShopeeAccount, StoreData } from "./types.ts";
 
 /**
  * The whole bot state lives in **one Deno KV record**, not in a file: Deno
@@ -139,6 +139,45 @@ export class Store {
     if (chat.activeAccount) return chat.accounts[chat.activeAccount];
     const all = Object.values(chat.accounts);
     return all.length === 1 ? all[0] : undefined;
+  }
+
+  // ── Shopee ───────────────────────────────────────────────────────────────
+
+  /** The Shopee sessions of one chat, created on first use. */
+  shopeeChat(chatId: number | string): Record<string, ShopeeAccount> {
+    const chat = this.chat(chatId);
+    chat.shopeeAccounts ??= {};
+    return chat.shopeeAccounts;
+  }
+
+  /** Look up a Shopee session by name, or the only one when there is a single. */
+  resolveShopee(chatId: number | string, name?: string): ShopeeAccount | undefined {
+    const all = this.shopeeChat(chatId);
+    if (name) return all[name];
+    const values = Object.values(all);
+    return values.length === 1 ? values[0] : undefined;
+  }
+
+  /** Shopee sessions with auto check-in on and a cookie that still works. */
+  autoShopeeAccounts(): Array<{ chatId: string; account: ShopeeAccount }> {
+    const out: Array<{ chatId: string; account: ShopeeAccount }> = [];
+    for (const [chatId, chat] of Object.entries(this.#data.chats)) {
+      for (const account of Object.values(chat.shopeeAccounts ?? {})) {
+        if (account.autoCheckIn && !account.sessionInvalid) out.push({ chatId, account });
+      }
+    }
+    return out;
+  }
+
+  /** Auto is on but the cookie was refused — needs a paste-a-new-one reminder. */
+  invalidShopeeAccounts(): Array<{ chatId: string; account: ShopeeAccount }> {
+    const out: Array<{ chatId: string; account: ShopeeAccount }> = [];
+    for (const [chatId, chat] of Object.entries(this.#data.chats)) {
+      for (const account of Object.values(chat.shopeeAccounts ?? {})) {
+        if (account.autoCheckIn && account.sessionInvalid) out.push({ chatId, account });
+      }
+    }
+    return out;
   }
 
   /**

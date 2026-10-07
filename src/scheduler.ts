@@ -1,5 +1,6 @@
 import { config } from "./config.ts";
 import { runCheckIn, sleep, vnDate } from "./checkin.ts";
+import { runShopeeCheckIn } from "./shopee.ts";
 import { store } from "./store.ts";
 import type { Sender } from "./telegram.ts";
 import type { Card } from "./view.ts";
@@ -146,6 +147,33 @@ export function catchUpCronSpec(): string {
   return cronSpecAt(currentSettings().nominalSeconds + (CATCH_UP_MINUTES - 1) * 60);
 }
 
+/**
+ * Shopee needs no sub-second wake-up — there is no race to win, the reward is
+ * the same whenever in the day it lands — so these two specs fire **on** the
+ * minute instead of the minute before it.
+ *
+ * Shopee stamps its own clock at `+08:00` while Vietnam is `+07:00`, so the day
+ * may roll at 23:00 VN (the cluster's midnight) or at 00:00 VN. Running at
+ * 00:00 VN with a catch-up 30 minutes later covers both: the first run is
+ * already inside a rolled day, or the second one catches it after it rolls.
+ */
+function cronSpecFor(vnSeconds: number): string {
+  const at = ((vnSeconds - VN_UTC_OFFSET) % SECONDS_PER_DAY + SECONDS_PER_DAY) % SECONDS_PER_DAY;
+  const minute = Math.floor(at / 60) % 60;
+  const hour = Math.floor(at / 3600) % 24;
+  return `${minute} ${hour} * * *`;
+}
+
+/** 00:00 Vietnam. */
+export function shopeeCronSpec(): string {
+  return cronSpecFor(0);
+}
+
+/** 00:30 Vietnam — second attempt when the first one found the day unrolled. */
+export function shopeeCatchUpCronSpec(): string {
+  return cronSpecFor(30 * 60);
+}
+
 /** How long to nap before the window opens. 0 when it is open already. */
 export function msUntilWindow(now: Date): number {
   if (planRun(now)) return 0;
@@ -272,4 +300,89 @@ async function safeSend(tg: Sender, chatId: string, card: Card) {
   } catch (e) {
     console.error(`[scheduler] failed to send to ${chatId}:`, e);
   }
+}
+
+// ── Shopee runner ─────────────────────────────────────────────────────────
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The Shopee half of the daily run.
+ *
+ * `force` (the 00:30 catch-up) re-enters even when the 00:00 run already
+ * started today, because that run may have found the server's day unrolled and
+ * come back empty. Each session short-circuits on its own `lastCheckInDay`, so
+ * a session credited at 00:00 is never touched again.
+ */
+export async function runShopeeDaily(tg: Sender, force = false): Promise<void> {
+  const day = vnDate(new Date());
+  const targets = store.autoShopeeAccounts();
+  const invalid = store.invalidShopeeAccounts();
+  if (!targets.length && !invalid.length) {
+    console.log(`[shopee] ${day}: no auto-enabled sessions.`);
+    return;
+  }
+  if (!force && store.data.lastShopeeRunDate === day) return;
+
+  store.data.lastShopeeRunDate = day;
+  store.touch();
+  await store.flush(); // the isolate may be suspended as soon as the cron handler returns
+
+  console.log(
+    `[shopee] ${day}: ${targets.length} check-ins, ${invalid.length} expired cookies.`,
+  );
+
+  for (const { chatId, account } of targets) {
+    // What the previous attempt today said — `runShopeeCheckIn` overwrites it.
+    const priorDay = account.lastResultDay;
+    const priorResult = account.lastCheckInResult;
+
+    const r = await runShopeeCheckIn(account);
+    console.log(`[shopee] ${account.name}: ${r.outcome}`);
+
+    if (r.outcome === "session_expired") {
+      const last = account.lastInvalidRemindAt ?? 0;
+      if (Date.now() - last < DAY_MS) continue;
+      account.lastInvalidRemindAt = Date.now();
+      store.touch();
+      await safeSend(tg, chatId, {
+        ...r.card,
+        subtitle: [account.name, r.card.subtitle].filter(Boolean).join(" · "),
+      });
+      continue;
+    }
+
+    // Credited by an earlier run today: the 00:00 card already said so.
+    if (account.lastCheckInDay === day && priorDay === day) continue;
+    // The same answer twice in one day (00:00, then again at 00:30) is noise.
+    if (priorDay === day && priorResult === r.outcome) continue;
+
+    await safeSend(tg, chatId, {
+      ...r.card,
+      subtitle: [account.name, r.card.subtitle].filter(Boolean).join(" · "),
+      footer: r.card.footer ?? "⏰ Tự động 00:00 · Asia/Ho_Chi_Minh",
+    });
+  }
+
+  // Dropped cookie: remind every 24h until the user pastes a new one.
+  for (const { chatId, account } of invalid) {
+    const last = account.lastInvalidRemindAt ?? 0;
+    if (Date.now() - last < DAY_MS) continue;
+    account.lastInvalidRemindAt = Date.now();
+    store.touch();
+    console.log(`[shopee] ${account.name}: cookie reminder`);
+    await safeSend(tg, chatId, {
+      icon: "🔒",
+      title: `${account.name}: cookie Shopee hết hạn`,
+      subtitle: account.invalidReason ?? "Phiên hết hạn",
+      tone: "error",
+      blocks: [{
+        text: `/shopee-login ${account.name} SPC_...=...; SPC_...=...`,
+        mono: true,
+      }],
+      footer: "Bot sẽ KHÔNG tự điểm danh cho tới khi bạn dán cookie mới.",
+    });
+  }
+
+  await store.flush();
 }
