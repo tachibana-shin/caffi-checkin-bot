@@ -165,12 +165,18 @@ With `DISCORD_TOKEN` empty the Discord side is skipped entirely.
 ## Bot identity
 
 ```bash
-deno task logo   # name, description and short description on Telegram + the Discord avatar
+deno task logo   # name + description on Telegram, avatar + application icon on Discord
 ```
 
-Everything comes from `assets/logo.png`, the icon lifted out of the APK. The picture itself has to
-be set by hand on Telegram: the Bot API has no call for a bot's own photo, so send `assets/logo.png`
-to @BotFather and run `/setuserpic` there.
+Everything comes from `assets/logo.png`, the icon lifted out of the APK. The script sets the names
+and descriptions on both platforms plus the Discord **bot avatar** (the picture people actually see
+in a chat). Two more pictures have to go up by hand — neither API exposes them:
+
+- **Telegram photo** — the Bot API has no call for a bot's own picture. Send `assets/logo.png` to
+  @BotFather and run `/setuserpic` there.
+- **Discord application icon** — `PATCH /oauth2/applications/@me` wants a _user_ token and answers a
+  bot token with `403 Bots cannot use this endpoint`. Developer Portal → General Information → App
+  Icon → upload `assets/logo.png` (512×512 PNG).
 
 ## Using the bot
 
