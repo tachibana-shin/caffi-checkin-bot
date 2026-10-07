@@ -1,0 +1,43 @@
+{
+  "name": "caffi-checkin-bot",
+  "version": "1.0.0",
+  "exports": "./src/main.ts",
+  "unstable": ["kv", "cron"],
+  "tasks": {
+    "start": "deno run -A --env-file=.env src/main.ts",
+    "dev": "deno run -A --env-file=.env --watch src/main.ts",
+    "webhook": "deno run -A --env-file=.env scripts/webhook.ts",
+    "check": "deno check src/main.ts scripts/*.ts",
+    "lint": "deno lint",
+    "smoke": "deno run -A scripts/smoke.ts",
+    "timing": "deno run -A scripts/timing.ts",
+    "view": "deno run -A scripts/view.ts",
+    "wiring": "deno run -A scripts/wiring.ts",
+    "deploycheck": "deno run -A --env-file=.env scripts/deploycheck.ts",
+    "logo": "deno run -A --env-file=.env scripts/logo.ts",
+    "fmt": "deno fmt"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "singleQuote": false
+  },
+  "imports": {
+    "@discordeno/bot": "npm:@discordeno/bot@^21.0.0",
+    "grammy": "npm:grammy@^1.46.0"
+  },
+  "deploy": {
+    "org": "tachibana-shin",
+    "app": "caffi-checkin-bot"
+  }
+}
+
+
+
+
+
+
