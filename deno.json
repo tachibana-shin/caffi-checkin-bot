@@ -11,6 +11,7 @@
     "check": "deno check src/main.ts scripts/*.ts",
     "lint": "deno lint",
     "smoke": "deno run -A scripts/smoke.ts",
+    "batch": "deno run -A scripts/batch.ts",
     "timing": "deno run -A scripts/timing.ts",
     "view": "deno run -A scripts/view.ts",
     "wiring": "deno run -A scripts/wiring.ts",

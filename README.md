@@ -337,6 +337,7 @@ deno task timing        # offline: midnight window, poll cadence, check-in decis
 deno task view          # offline: every screen rendered as Telegram HTML + Discord embed
 deno task wiring        # offline grammY routing test (no Telegram calls)
 deno task smoke         # store encryption round-trip + live API error branches
+deno task batch         # offline: the nightly batch — one watcher, POSTs together
 deno task deploycheck   # offline pre-flight for the Deno Deploy shape (+ live probes
                         #  when PUBLIC_URL is in .env)
 ```
