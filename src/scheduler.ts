@@ -1,5 +1,5 @@
 import { config } from "./config.ts";
-import { runCheckIn, sleep, vnDate } from "./checkin.ts";
+import { runCheckIn, sleep, vnDate, vnMidnightMs } from "./checkin.ts";
 import { store } from "./store.ts";
 import type { Sender } from "./telegram.ts";
 import type { Card } from "./view.ts";
@@ -13,6 +13,22 @@ const SECONDS_PER_DAY = 86_400;
 const VN_UTC_OFFSET = 7 * 3600;
 /** `Deno.cron` runs in UTC and only fires once a minute, so this is the longest nap it may take. */
 const MAX_PRE_ROLL_SLEEP = 2 * 3600 * 1000;
+/**
+ * How far ahead of the attempt window the pre-roll job is registered.
+ *
+ * Deno Deploy promises only that "the exact invocation time of your `Deno.cron`
+ * handler may vary by up to a minute from the scheduled time". The window opens
+ * `CHECKIN_EARLY_SECONDS` before midnight, so a spec sitting in the minute right
+ * before it leaves *less than a minute* of slack: the jitter eats the nap and the
+ * isolate wakes up **after** the day has already turned. It did — on 2026-10-08
+ * the job started at 00:00:02.8 and the check-in landed on second 6, because
+ * every millisecond of the pre-roll is spent establishing the connection instead
+ * of polling for the flip.
+ *
+ * Firing early is free: `msUntilWindow` just sleeps longer. Three minutes of lead
+ * absorbs about four minutes of jitter while keeping the nap itself short.
+ */
+const PRE_ROLL_LEAD_SECONDS = 3 * 60;
 
 const FORMATTER = new Intl.DateTimeFormat("en-GB", {
   timeZone: "Asia/Ho_Chi_Minh",
@@ -136,9 +152,12 @@ function cronSpecAt(vnSeconds: number): string {
   return `${minute} ${hour} * * *`;
 }
 
-/** Daily 24/7: fires just before the window opens so it can nap to the exact second. */
+/**
+ * Daily 24/7: fires `PRE_ROLL_LEAD_SECONDS` before the window so the jitter of
+ * the platform cannot push the wake-up past midnight; the handler naps the rest.
+ */
 export function preRollCronSpec(): string {
-  return cronSpecAt(windowStartSeconds());
+  return cronSpecAt(windowStartSeconds() - PRE_ROLL_LEAD_SECONDS);
 }
 
 /** Safety net, `CATCH_UP_MINUTES - 1` after the scheduled time. */
@@ -236,6 +255,13 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<v
 
     const r = await runCheckIn(account, { runDate: date, retryUntil });
     console.log(`[scheduler] ${account.username}: ${r.outcome}`);
+    // The whole pre-roll exists to land this POST as close to 00:00 as it can.
+    if (r.postedAt !== undefined) {
+      const delta = r.postedAt - vnMidnightMs(date);
+      console.log(
+        `[scheduler] ${account.username}: POST ${delta >= 0 ? "+" : ""}${delta}ms after 00:00`,
+      );
+    }
 
     if (r.outcome === "already_done") continue;
     const stamp = `${String(config.checkInHour).padStart(2, "0")}:` +

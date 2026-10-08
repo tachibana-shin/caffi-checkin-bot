@@ -161,8 +161,8 @@ check("the two jobs do not land on the same minute", preRoll !== catchUp);
 
 const preLead = lead(firesAt(preRoll), windowStart - 1);
 check(
-  "pre-roll fires in the minute the window opens",
-  preLead < 60,
+  "pre-roll fires 2-10 minutes before the window opens",
+  preLead >= 120 && preLead < 600,
   `${preRoll} -> naps ${preLead + 1}s to ${hhmmss(windowStart)} VN`,
 );
 const catchLead = lead(firesAt(catchUp), nominal + 29 * 60 - 1);

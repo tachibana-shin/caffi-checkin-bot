@@ -248,9 +248,14 @@ Deno Deploy has no writable filesystem and no single long-lived process, so ther
 | schedule | timers in `src/scheduler.ts`               | two `Deno.cron` jobs from `src/cron.ts`                     |
 
 The handler still naps to the exact second (`msUntilWindow`), so the cron only has to wake an
-isolate at the right minute: `caffi-checkin-pre-roll` at `59 16 * * *` UTC (23:59 VN) and
-`caffi-checkin-catch-up` at `28 17 * * *` UTC (00:28 VN). The catch-up run no-ops when the pre-roll
-already finished, so a redeploy in the middle of the window cannot check in twice.
+isolate _near_ the window: `caffi-checkin-pre-roll` at `56 16 * * *` UTC (23:56 VN) and
+`caffi-checkin-catch-up` at `28 17 * * *` UTC (00:28 VN). The pre-roll deliberately fires **three
+minutes early**: Deno Deploy documents that "the exact invocation time of your `Deno.cron` handler
+may vary by up to a minute from the scheduled time", and a spec in the minute right before midnight
+leaves less than a minute of slack for that jitter. On 2026-10-08 the job started at 00:00:02
+instead of 23:59:00, so the isolate opened the connection _after_ the day had turned and the
+check-in landed on second 6. The catch-up run no-ops when the pre-roll already finished, so a
+redeploy in the middle of the window cannot check in twice.
 
 ### First deploy
 
