@@ -135,7 +135,9 @@ simultaneous. One poller also keeps the request rate at one session instead of N
 A run that starts when the day is already open — a restart, the catch-up cron, a re-run — cannot
 race anyone, so `runCheckInAll` asks each account on its own session instead and honours "already
 checked in" per login. If the watcher's session is dead the watch passes to the next account, and a
-POST that still answers "day not open" falls back to that account's own `runCheckIn` loop.
+POST that still answers "day not open" falls back to that account's own `runCheckIn` loop. Access
+tokens are refreshed up front (`CaffiApi.warm`) when their JWT `exp` is near: a 401-driven refresh
+costs two extra round trips, which must not land on the POST being timed.
 
 The run is keyed by the **target day**, not by the wall clock, so a run that starts at 23:59:55 and
 one that continues at 00:00:03 count as the same run — no double check-in across midnight.

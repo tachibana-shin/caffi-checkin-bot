@@ -237,6 +237,17 @@ export async function runCheckInAll(
   const deadline = opts.retryUntil ?? 0;
   if (!targets.length) return [];
 
+  // A 401 costs two extra round trips, and they would land on the POST whose
+  // rank is being measured. Warm the tokens that are about to lapse while the
+  // second is still worth nothing.
+  await Promise.all(targets.map(async ({ account }) => {
+    try {
+      await apiFor(account).warm();
+    } catch {
+      // Nothing to fix here — the POST reports the dead session.
+    }
+  }));
+
   // The watcher is the first account that can still read the server. A dead
   // session must not burn the window — hand the watch to the next one.
   let gate: DayOpenMode | null = null;

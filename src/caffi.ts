@@ -115,6 +115,18 @@ async function raw(
   return { status: res.status, body };
 }
 
+/** `exp` of a JWT access token, as epoch ms. Opaque tokens have none. */
+function tokenExpMs(token: string): number | undefined {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[1] === undefined) return undefined;
+  try {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof payload.exp === "number" ? payload.exp * 1000 : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function errorFrom(r: RawResponse): CaffiError {
   const code = r.body?.error?.code ??
     (r.status === 401 ? "NOT_AUTHENTICATED" : `HTTP_${r.status}`);
@@ -186,6 +198,23 @@ export class CaffiApi {
       throw new CaffiError("Phản hồi refresh thiếu accessToken", "BAD_REFRESH");
     }
     return { accessToken: data.accessToken, refreshToken: data.refreshToken ?? refreshToken };
+  }
+
+  /**
+   * Refresh a token that is about to lapse, before anything is racing for it.
+   *
+   * `call()` refreshes on a 401, and those two extra round trips land on the
+   * POST whose rank is being measured. The access token is a JWT, so its `exp`
+   * is readable without a request — only the accounts that are actually
+   * expiring pay for a refresh, now, while the second still costs nothing.
+   * Opaque tokens (no readable `exp`) are left to the 401 path.
+   */
+  async warm(leadMs = 60_000): Promise<void> {
+    const tokens = this.session.getTokens();
+    if (!tokens.refreshToken) return;
+    const exp = tokenExpMs(tokens.accessToken);
+    if (exp === undefined || exp - leadMs > Date.now()) return;
+    this.session.saveTokens(await this.refresh(tokens.refreshToken));
   }
 
   #kill(reason: string) {

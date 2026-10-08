@@ -38,6 +38,11 @@ const S: Stub = {
 
 const posts: Array<{ user: string; at: number }> = [];
 const statusReads: Array<{ user: string; at: number }> = [];
+const refreshes: Array<{ token: string; at: number }> = [];
+
+/** A JWT-shaped access token with the given `exp` (seconds). */
+const jwt = (exp: number) =>
+  `h.${btoa(JSON.stringify({ exp })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}.s`;
 
 // The stub answers synchronously; `fetch` is awaited by the client either way,
 // so a cast is all the typing this needs.
@@ -53,8 +58,14 @@ const stub = (input: unknown, init?: RequestInit): Response => {
   const now = Date.now();
 
   if (path === "/auth/mobile/refresh" && method === "POST") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { refreshToken?: string };
+    refreshes.push({ token: String(body.refreshToken), at: now });
     // A dead session cannot be brought back — the client flags it for /login.
-    return json(401, { error: { code: "REFRESH_TOKEN_INVALID" } });
+    if (S.dead.has(String(body.refreshToken))) {
+      return json(401, { error: { code: "REFRESH_TOKEN_INVALID" } });
+    }
+    const next = jwt(Math.floor((Date.now() + 3_600_000) / 1000));
+    return json(200, { data: { accessToken: next, refreshToken: `${body.refreshToken}` } });
   }
 
   if (path === "/api/v2/xeng/check-in/status") {
@@ -117,7 +128,9 @@ function account(username: string) {
   return {
     username,
     password: "pw",
-    tokens: { accessToken: username, refreshToken: `${username}-r` },
+    // The username doubles as both tokens: the stub keys a dead session off the
+    // bearer it sees, so marking `a@x.com` dead has to kill auth *and* refresh.
+    tokens: { accessToken: username, refreshToken: username },
     autoCheckIn: true,
     sessionInvalid: false,
     createdAt: new Date().toISOString(),
@@ -127,6 +140,7 @@ function account(username: string) {
 function reset() {
   posts.length = 0;
   statusReads.length = 0;
+  refreshes.length = 0;
   S.dead.clear();
   S.alreadyIn.clear();
 }
@@ -222,6 +236,39 @@ check(
 );
 const sentHanded = posts.map((p) => p.at);
 check("the surviving account raced on its own", sentHanded.length === 1);
+
+// ── 4. Expiring token: refreshed before the race, not during it ────────────
+reset();
+S.mode = "race";
+S.flipAt = Date.now() + 250;
+const stale = account("stale@x.com");
+// A JWT that expired yesterday: `warm` must replace it up front, so the POST
+// does not spend two round trips discovering that.
+stale.tokens = {
+  accessToken: jwt(Math.floor((Date.now() - 86_400_000) / 1000)),
+  refreshToken: "stale@x.com",
+};
+const warmed = await runCheckInAll(
+  [{ chatId: "tg:1", account: stale }, { chatId: "tg:1", account: account("main@x.com") }],
+  { runDate: TODAY, retryUntil: Date.now() + 60_000 },
+);
+const sentWarm = posts.map((p) => p.at);
+check(
+  "the expiring token was refreshed",
+  refreshes.length === 1,
+  `${refreshes.length} refresh(es)`,
+);
+check(
+  "the refreshed account uses the new token",
+  posts.some((p) => p.user !== "main@x.com") &&
+    stale.tokens.accessToken !== jwt(Math.floor((Date.now() - 86_400_000) / 1000)),
+);
+check(
+  "the refresh did not push the POST out of the race",
+  posts.length === 2 && Math.max(...sentWarm) - Math.min(...sentWarm) < 50,
+  `${posts.length} POST(s), ${Math.max(...sentWarm) - Math.min(...sentWarm)}ms apart`,
+);
+check("both accounts checked in", warmed.every((r) => r.result.outcome === "checked_in"));
 
 console.log(failed ? `\n${failed} check(s) FAILED` : "\nAll OK");
 Deno.exit(failed ? 1 : 0);
