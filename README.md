@@ -286,8 +286,10 @@ deno deploy env load /tmp/app.env --replace --org <org> --app <app>
 #    to be shared (the keys are namespaced under "caffi").
 deno deploy database assign <db> --org <org> --app <app>
 
-# 3. Ship it.
-deno deploy --prod --non-interactive --org <org> --app <app> .
+# 3. Ship it. The app is linked to the GitHub repo, so the normal way to ship is a push:
+git push origin main            # main is built and deployed to production automatically
+# A one-off without a commit still works:
+# deno deploy --prod --non-interactive --org <org> --app <app> .
 ```
 
 Without step 2 the first boot dies with _"no KV database is attached to this app"_.

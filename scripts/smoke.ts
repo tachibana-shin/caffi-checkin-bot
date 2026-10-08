@@ -31,8 +31,14 @@ chat.accounts["test-user"] = {
 store.touch();
 await store.flush();
 
-const onDisk = await Deno.readTextFile("/tmp/opencode/caffi-smoke/store.json");
-check("store encrypted on disk", !onDisk.includes("mat-khau") && onDisk.includes("payload"));
+// The KV file itself is an opaque SQLite page, so assert on the stored record.
+const kv = await Deno.openKv("/tmp/opencode/caffi-smoke/store.kv");
+const raw = (await kv.get<string>(["caffi", "store"])).value;
+await kv.close();
+check(
+  "store encrypted on disk",
+  !!raw && !raw.includes("mat-khau") && raw.includes("payload"),
+);
 
 const fresh = new Store();
 await fresh.load();
