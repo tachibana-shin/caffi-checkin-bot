@@ -124,6 +124,15 @@ What happens at run time (`runCheckIn`):
    is written ~200ms before the check-in row, so the very first read can still return the previous
    streak (observed: it answered 3 when the correct value was 4).
 
+**Several accounts, one race.** Only the **first** account runs the poll loop. The others sleep
+until 00:00:00 and then do a single status read of their own, all in parallel — the day flips on the
+server's clock, so a read that lands after it is worth exactly as much as 50 polling steps, and N
+logins therefore cost N requests instead of N poll loops (which would also multiply the request rate
+by N and walk straight into a rate limit). Everything is awaited together, so the accounts no longer
+queue up behind each other's read-back and Telegram send: with two accounts they land roughly one
+round trip apart instead of roughly one card-send apart. If a follower's read still answers
+`pending_day` — our clock ahead of the server's — it simply falls back into the same 50ms loop.
+
 The run is keyed by the **target day**, not by the wall clock, so a run that starts at 23:59:55 and
 one that continues at 00:00:03 count as the same run — no double check-in across midnight.
 

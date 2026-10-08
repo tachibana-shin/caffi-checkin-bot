@@ -248,22 +248,33 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<v
     `[scheduler] ${date}: ${targets.length} check-ins, ${invalid.length} expired sessions.`,
   );
 
-  for (const { chatId, account } of targets) {
+  // Only the first account polls for the flip; the rest wake up at midnight.
+  //
+  // The day turns on the *server's* clock, so one status read after it is as
+  // good as a hundred — having every account run the 50ms loop would multiply
+  // the request rate by the number of logins (straight into rate-limit
+  // territory) without landing a single POST any earlier. Waking them together
+  // keeps all of them within one round trip of each other, instead of queueing
+  // each one behind the previous account's status read-back and Telegram send.
+  const midnight = vnMidnightMs(date);
+  await Promise.all(targets.map(async ({ chatId, account }, index) => {
     // Optional stagger — leave CHECKIN_JITTER_MAX at 0 to stay first in line.
     const jitter = Math.floor(Math.random() * Math.max(0, config.checkInJitterMax) * 1000);
     if (jitter > 0) await sleep(jitter);
+    // A run that starts after midnight (catch-up, restart) must not wait at all.
+    if (index > 0) await sleep(Math.max(0, midnight - Date.now()));
 
     const r = await runCheckIn(account, { runDate: date, retryUntil });
     console.log(`[scheduler] ${account.username}: ${r.outcome}`);
     // The whole pre-roll exists to land this POST as close to 00:00 as it can.
     if (r.postedAt !== undefined) {
-      const delta = r.postedAt - vnMidnightMs(date);
+      const delta = r.postedAt - midnight;
       console.log(
         `[scheduler] ${account.username}: POST ${delta >= 0 ? "+" : ""}${delta}ms after 00:00`,
       );
     }
 
-    if (r.outcome === "already_done") continue;
+    if (r.outcome === "already_done") return;
     const stamp = `${String(config.checkInHour).padStart(2, "0")}:` +
       `${String(config.checkInMinute).padStart(2, "0")}`;
     await safeSend(tg, chatId, {
@@ -272,7 +283,7 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<v
       subtitle: [account.username, r.card.subtitle].filter(Boolean).join(" · "),
       footer: `⏰ Tự động ${stamp} · ${config.timeZone}`,
     });
-  }
+  }));
 
   // Dropped session: remind every 24h until the user sends /login again.
   for (const { chatId, account } of invalid) {
