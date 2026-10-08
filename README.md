@@ -108,30 +108,34 @@ polls in 50ms steps across the flip rather than once a second.
 | -------------------------- | ------- | --------------------------------------------------------------------------------- |
 | `CHECKIN_EARLY_SECONDS`    | `5`     | Start attempting at **23:59:55** for a 00:00 schedule                             |
 | `CHECKIN_MAX_WAIT_SECONDS` | `600`   | If the server still counts the previous day, keep knocking for this long (10 min) |
-| `CHECKIN_JITTER_MAX`       | `0`     | Random stagger per account. Keep `0` — raising it costs ranking                   |
 
-What happens at run time (`runCheckIn`):
+What happens at run time (`runCheckIn` for one account, `runCheckInAll` for the nightly batch):
 
 1. `GET /check-in/status`.
 2. `todayCheckedIn === false` → the server opened the new day → `POST /check-in` **immediately**.
 3. `todayCheckedIn === true` but the newest `history[].checkInDate` is still _before_ the target day
    → the clock has not rolled over yet → poll again. The cadence comes from `pollDelay`: **50ms**
    across the two seconds either side of the deadline (first place on the server's own `earliest`
-   leaderboard sits at +134ms, and one round trip is ~36ms), then 1s for the first 20s, then 10s.
+   leaderboard sits at +134ms), then 1s for the first 20s, then 10s.
 4. A premature `POST` that the server rejects is retried the same way, until
    `CHECKIN_MAX_WAIT_SECONDS` elapses. Rate-limited responses are _not_ retried.
 5. After a successful `POST` the status is read back until it actually reflects it — the wallet row
    is written ~200ms before the check-in row, so the very first read can still return the previous
    streak (observed: it answered 3 when the correct value was 4).
 
-**Several accounts, one race.** Only the **first** account runs the poll loop. The others sleep
-until 00:00:00 and then do a single status read of their own, all in parallel — the day flips on the
-server's clock, so a read that lands after it is worth exactly as much as 50 polling steps, and N
-logins therefore cost N requests instead of N poll loops (which would also multiply the request rate
-by N and walk straight into a rate limit). Everything is awaited together, so the accounts no longer
-queue up behind each other's read-back and Telegram send: with two accounts they land roughly one
-round trip apart instead of roughly one card-send apart. If a follower's read still answers
-`pending_day` — our clock ahead of the server's — it simply falls back into the same 50ms loop.
+**Several accounts, one race.** One account's session watches for the flip (`waitForDayOpen`); the
+moment it lands, **every** `POST` is issued from the same `Promise.all`, with the per-account status
+read skipped on purpose. That read is one round trip (~250ms from the `ord`/`ams` regions to the
+Caffi servers in Vietnam), and one read per account is exactly what used to cost the ranking:
+measured on 2026-10-09, the account that had been watching since the pre-roll got **rank 3 at
+00:00:00** while the one that woke up at midnight and had to discover the flip by itself got **rank
+10 at 00:00:01** — a round trip of distance between two check-ins that should have been
+simultaneous. One poller also keeps the request rate at one session instead of N.
+
+A run that starts when the day is already open — a restart, the catch-up cron, a re-run — cannot
+race anyone, so `runCheckInAll` asks each account on its own session instead and honours "already
+checked in" per login. If the watcher's session is dead the watch passes to the next account, and a
+POST that still answers "day not open" falls back to that account's own `runCheckIn` loop.
 
 The run is keyed by the **target day**, not by the wall clock, so a run that starts at 23:59:55 and
 one that continues at 00:00:03 count as the same run — no double check-in across midnight.

@@ -52,8 +52,6 @@ export const config = {
   checkInEarlySeconds: int("CHECKIN_EARLY_SECONDS", 5),
   /** Keep retrying for this long after the scheduled time while the day has not rolled yet. */
   checkInMaxWaitSeconds: int("CHECKIN_MAX_WAIT_SECONDS", 600),
-  /** Optional stagger between accounts. Keep 0 if you want to be first. */
-  checkInJitterMax: int("CHECKIN_JITTER_MAX", 0),
   dataDir: Deno.env.get("DATA_DIR") ?? "data",
   /**
    * One-shot seed for an empty Deno KV: the exact contents of a legacy

@@ -44,6 +44,12 @@ export interface RunCheckInOptions {
   retryUntil?: number;
 }
 
+/** One chat's account, as the nightly run needs it. */
+export interface CheckInTarget {
+  chatId: string;
+  account: Account;
+}
+
 const fmt = (n: unknown): string =>
   typeof n === "number" && Number.isFinite(n) ? n.toLocaleString("vi-VN") : "—";
 
@@ -79,10 +85,10 @@ export function vnMidnightMs(runDate: string): number {
 /**
  * How long to wait before re-reading the status.
  *
- * The `earliest` leaderboard puts first place at +134ms past midnight and one
- * round trip is ~36ms, so a 1s poll can only ever land near +500ms (about 4th).
- * Polling every 50ms across the couple of seconds either side of the deadline
- * shrinks the window in which the day can flip unnoticed to under 100ms.
+ * The `earliest` leaderboard puts first place at +134ms past midnight, so a 1s
+ * poll can only ever land near +500ms (about 4th). Polling every 50ms across the
+ * couple of seconds either side of the deadline shrinks the window in which the
+ * day can flip unnoticed to under 100ms.
  * Everywhere else backs off to 1s, then 10s, so a slow server costs nothing.
  */
 export function pollDelay(targetMs: number, nowMs: number, startedAtMs: number): number {
@@ -139,6 +145,130 @@ export async function runCheckIn(
   }
 }
 
+/** How `waitForDayOpen` learned that the server has opened the day. */
+type DayOpenMode = "race" | "catch_up";
+
+/**
+ * One session watches the server until it counts `runDate` as today.
+ *
+ * Nothing else can answer "is it midnight on the server yet": the flip is only
+ * visible in a status read. Sharing the watch is what makes every POST land
+ * together — on its own each account pays for the discovery, and with a ~250ms
+ * round trip to the Caffi servers that is the whole race: measured on
+ * 2026-10-09 the account that watched from the pre-roll got rank 3 at
+ * 00:00:00 while the one that woke up at midnight and had to look for itself
+ * got rank 10 at 00:00:01.
+ *
+ * Returns `"race"` when the day flipped while we were waiting — nobody has
+ * checked in for it yet — and `"catch_up"` when it was already open, which
+ * means each account has to answer "already done?" for itself.
+ */
+async function waitForDayOpen(
+  api: CaffiApi,
+  runDate: string,
+  deadline: number,
+): Promise<DayOpenMode | null> {
+  const targetMs = vnMidnightMs(runDate);
+  const startedAt = Date.now();
+  let reads = 0;
+
+  for (;;) {
+    reads++;
+    try {
+      const s = await api.getCheckInStatus();
+      // "check_in" (fresh day, not yet taken) and "already_done" (this account
+      // is in) both mean the day is open; only the previous day blocks.
+      if (decideFromStatus(s, runDate) !== "pending_day") return reads === 1 ? "catch_up" : "race";
+      await sleep(pollDelay(targetMs, Date.now(), startedAt));
+    } catch (e) {
+      if (e instanceof SessionExpiredError) throw e;
+      // A dropped read is not a verdict: come back quickly instead of backing
+      // off to 10s, which a pre-roll cannot afford.
+      if (Date.now() >= deadline) return null;
+      await sleep(200);
+    }
+    if (Date.now() >= deadline) return null;
+  }
+}
+
+/**
+ * The POST itself, with the status read skipped on purpose.
+ *
+ * Only safe once `waitForDayOpen` has seen the flip: a read costs one round
+ * trip (~250ms to Vietnam), and one read per account is exactly what used to
+ * spread the accounts a second apart. `postedAt` is stamped the moment the
+ * request leaves, so the log measures what the leaderboard ranks.
+ */
+async function postAtOpen(
+  account: Account,
+  runDate: string,
+  deadline: number,
+): Promise<CheckInResult> {
+  const api = apiFor(account);
+  const postedAt = Date.now();
+  try {
+    await api.postCheckIn();
+  } catch (e) {
+    if (e instanceof SessionExpiredError) return sessionExpiredCard(e, account);
+    const err = e as Error & { code?: string };
+    if (err.code === "RATE_LIMITED") return failedCard(err);
+    // The gate can lag the server's clock by a round trip; retry this one
+    // account on its own rather than losing the run.
+    return await runCheckIn(account, { runDate, retryUntil: deadline });
+  }
+  return await finishCheckIn(api, account, runDate, null, postedAt);
+}
+
+/**
+ * Check every account in as close to the same instant as possible.
+ *
+ * `runCheckIn` answers "what does this one account see" and polls on its own,
+ * which is right for a manual `/checkin`. For the nightly race it is wasteful:
+ * every account polls and then each lands on its own round trip. Here one
+ * session watches for the flip and every POST is issued from a single
+ * `Promise.all`, so the requests leave within microseconds of each other and
+ * arrive within one round trip of each other.
+ */
+export async function runCheckInAll(
+  targets: CheckInTarget[],
+  opts: RunCheckInOptions = {},
+): Promise<Array<CheckInTarget & { result: CheckInResult }>> {
+  const runDate = opts.runDate ?? vnDate();
+  const deadline = opts.retryUntil ?? 0;
+  if (!targets.length) return [];
+
+  // The watcher is the first account that can still read the server. A dead
+  // session must not burn the window — hand the watch to the next one.
+  let gate: DayOpenMode | null = null;
+  for (const target of targets) {
+    try {
+      gate = await waitForDayOpen(apiFor(target.account), runDate, deadline);
+      break;
+    } catch (e) {
+      if (!(e instanceof SessionExpiredError)) throw e;
+    }
+  }
+
+  // The flip was observed: everyone POSTs at once, reads skipped.
+  if (gate === "race") {
+    return await Promise.all(
+      targets.map(async (target) => ({
+        ...target,
+        result: await postAtOpen(target.account, runDate, deadline),
+      })),
+    );
+  }
+
+  // Already open (catch-up, restart, a re-run) or we ran out of window: answer
+  // each account on its own session, so "already checked in" is respected.
+  return await Promise.all(
+    targets.map(async (target) => ({
+      ...target,
+      result: await runCheckIn(target.account, { runDate, retryUntil: deadline }),
+    })),
+  );
+}
+
 /** One status check + one POST. Retries are decided by the caller. */
 async function attemptCheckIn(
   api: CaffiApi,
@@ -172,68 +302,91 @@ async function attemptCheckIn(
       return { outcome: "pending_day", card: emptyCard(), retryable: true };
     }
 
-    await api.postCheckIn();
     const postedAt = Date.now();
-
-    // Re-read status + balance to report the real outcome.
-    const [after, wallet] = await Promise.all([
-      readConfirmedStatus(api, before),
-      api.getWallet().catch(() => null),
-    ]);
-
-    account.lastCheckInDay = runDate;
-    account.lastCheckInResult = "ok";
-    store.touch();
-
-    const balance = balanceOf(wallet);
-    const position = fmt(after?.todayCheckInPosition);
-    const confirmed = after?.todayCheckedIn === true;
-    return {
-      outcome: "checked_in",
-      postedAt,
-      card: {
-        icon: confirmed ? "🎉" : "⚠️",
-        title: confirmed ? "Điểm danh thành công" : "Đã gửi yêu cầu, chưa xác nhận",
-        tone: confirmed ? "success" : "warn",
-        stats: [
-          { label: "Chuỗi hiện tại", value: `${fmt(after?.currentStreak)} ngày` },
-          { label: "Hạng hôm nay", value: position },
-          { label: "Số Xèng trong ví", value: balance },
-          { label: "Điểm danh lúc", value: checkedInAtOf(after) ?? nowVn() },
-        ],
-      },
-    };
+    await api.postCheckIn();
+    return await finishCheckIn(api, account, runDate, before, postedAt);
   } catch (e) {
-    if (e instanceof SessionExpiredError) {
-      return {
-        outcome: "session_expired",
-        card: {
-          icon: "🔒",
-          title: "Phiên đã bị đăng xuất",
-          subtitle: e.message,
-          tone: "error",
-          blocks: [{
-            text: `Tài khoản: ${account.username}\n\n` +
-              `Gửi lại lệnh để tiếp tục:\n` +
-              `/login ${account.username} ${account.password}`,
-            mono: true,
-          }],
-        },
-      };
-    }
-    const err = e as Error & { code?: string };
-    // A premature attempt is rejected by the server — that is exactly what we retry.
-    return {
-      outcome: "failed",
-      retryable: err.code !== "RATE_LIMITED",
-      card: {
-        icon: "⚠️",
-        title: "Điểm danh thất bại",
-        subtitle: err.code ? `${err.message} (${err.code})` : err.message,
-        tone: "error",
-      },
-    };
+    if (e instanceof SessionExpiredError) return sessionExpiredCard(e, account);
+    return failedCard(e as Error & { code?: string });
   }
+}
+
+function sessionExpiredCard(e: SessionExpiredError, account: Account): CheckInResult {
+  return {
+    outcome: "session_expired",
+    card: {
+      icon: "🔒",
+      title: "Phiên đã bị đăng xuất",
+      subtitle: e.message,
+      tone: "error",
+      blocks: [{
+        text: `Tài khoản: ${account.username}\n\n` +
+          `Gửi lại lệnh để tiếp tục:\n` +
+          `/login ${account.username} ${account.password}`,
+        mono: true,
+      }],
+    },
+  };
+}
+
+/**
+ * A POST or a status read that could not be answered. Only a rate limit is
+ * worth treating as fatal — a premature attempt waits for the day to open.
+ */
+function failedCard(err: Error & { code?: string }): CheckInResult {
+  return {
+    outcome: "failed",
+    retryable: err.code !== "RATE_LIMITED",
+    card: {
+      icon: "⚠️",
+      title: "Điểm danh thất bại",
+      subtitle: err.code ? `${err.message} (${err.code})` : err.message,
+      tone: "error",
+    },
+  };
+}
+
+/**
+ * Everything after the POST went out: confirm it really landed, report it.
+ *
+ * `before` is the status read that came first — null when the caller skipped
+ * that read on purpose (the day was known to be open already).
+ */
+async function finishCheckIn(
+  api: CaffiApi,
+  account: Account,
+  runDate: string,
+  before: CheckInStatus | null,
+  postedAt: number,
+): Promise<CheckInResult> {
+  // Re-read status + balance to report the real outcome.
+  const [after, wallet] = await Promise.all([
+    readConfirmedStatus(api, before),
+    api.getWallet().catch(() => null),
+  ]);
+
+  account.lastCheckInDay = runDate;
+  account.lastCheckInResult = "ok";
+  store.touch();
+
+  const balance = balanceOf(wallet);
+  const position = fmt(after?.todayCheckInPosition);
+  const confirmed = after?.todayCheckedIn === true;
+  return {
+    outcome: "checked_in",
+    postedAt,
+    card: {
+      icon: confirmed ? "🎉" : "⚠️",
+      title: confirmed ? "Điểm danh thành công" : "Đã gửi yêu cầu, chưa xác nhận",
+      tone: confirmed ? "success" : "warn",
+      stats: [
+        { label: "Chuỗi hiện tại", value: `${fmt(after?.currentStreak)} ngày` },
+        { label: "Hạng hôm nay", value: position },
+        { label: "Số Xèng trong ví", value: balance },
+        { label: "Điểm danh lúc", value: checkedInAtOf(after) ?? nowVn() },
+      ],
+    },
+  };
 }
 
 /**
@@ -248,7 +401,7 @@ async function attemptCheckIn(
  */
 async function readConfirmedStatus(
   api: CaffiApi,
-  before: CheckInStatus,
+  before: CheckInStatus | null,
 ): Promise<CheckInStatus | null> {
   let last: CheckInStatus | null = null;
   let confirmed: CheckInStatus | null = null;
@@ -258,7 +411,7 @@ async function readConfirmedStatus(
       last = s;
       if (s.todayCheckedIn) {
         confirmed = s;
-        if ((s.currentStreak ?? 0) > (before.currentStreak ?? 0)) return s;
+        if ((s.currentStreak ?? 0) > (before?.currentStreak ?? -1)) return s;
       }
     }
     if (i < 2) await sleep(250);

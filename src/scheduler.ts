@@ -1,5 +1,5 @@
 import { config } from "./config.ts";
-import { runCheckIn, sleep, vnDate, vnMidnightMs } from "./checkin.ts";
+import { runCheckInAll, vnDate, vnMidnightMs } from "./checkin.ts";
 import { store } from "./store.ts";
 import type { Sender } from "./telegram.ts";
 import type { Card } from "./view.ts";
@@ -248,23 +248,15 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<v
     `[scheduler] ${date}: ${targets.length} check-ins, ${invalid.length} expired sessions.`,
   );
 
-  // Only the first account polls for the flip; the rest wake up at midnight.
-  //
-  // The day turns on the *server's* clock, so one status read after it is as
-  // good as a hundred — having every account run the 50ms loop would multiply
-  // the request rate by the number of logins (straight into rate-limit
-  // territory) without landing a single POST any earlier. Waking them together
-  // keeps all of them within one round trip of each other, instead of queueing
-  // each one behind the previous account's status read-back and Telegram send.
-  const midnight = vnMidnightMs(date);
-  await Promise.all(targets.map(async ({ chatId, account }, index) => {
-    // Optional stagger — leave CHECKIN_JITTER_MAX at 0 to stay first in line.
-    const jitter = Math.floor(Math.random() * Math.max(0, config.checkInJitterMax) * 1000);
-    if (jitter > 0) await sleep(jitter);
-    // A run that starts after midnight (catch-up, restart) must not wait at all.
-    if (index > 0) await sleep(Math.max(0, midnight - Date.now()));
+  // One session watches for the server to open the day, then every POST goes
+  // out in the same Promise.all. Letting each account wake up at midnight and
+  // find the flip on its own cost each of them a full round trip and spread
+  // them a second apart — 09-10-2026: rank 3 at 00:00:00, rank 10 at 00:00:01.
+  const results = await runCheckInAll(targets, { runDate: date, retryUntil });
 
-    const r = await runCheckIn(account, { runDate: date, retryUntil });
+  const sends: Array<Promise<void>> = [];
+  const midnight = vnMidnightMs(date);
+  for (const { chatId, account, result: r } of results) {
     console.log(`[scheduler] ${account.username}: ${r.outcome}`);
     // The whole pre-roll exists to land this POST as close to 00:00 as it can.
     if (r.postedAt !== undefined) {
@@ -274,16 +266,17 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<v
       );
     }
 
-    if (r.outcome === "already_done") return;
+    if (r.outcome === "already_done") continue;
     const stamp = `${String(config.checkInHour).padStart(2, "0")}:` +
       `${String(config.checkInMinute).padStart(2, "0")}`;
-    await safeSend(tg, chatId, {
+    sends.push(safeSend(tg, chatId, {
       ...r.card,
       // Keep the account visible: one chat may hold several Caffi logins.
       subtitle: [account.username, r.card.subtitle].filter(Boolean).join(" · "),
       footer: `⏰ Tự động ${stamp} · ${config.timeZone}`,
-    });
-  }));
+    }));
+  }
+  await Promise.all(sends);
 
   // Dropped session: remind every 24h until the user sends /login again.
   for (const { chatId, account } of invalid) {
