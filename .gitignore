@@ -4,3 +4,7 @@ data/
 node_modules/
 .dev.vars
 .wrangler/
+
+# bun.lock is not committed: the Cloudflare build image ships bun 1.2, which
+# cannot read the v2 lockfile a newer bun writes.
+bun.lock

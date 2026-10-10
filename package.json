@@ -1,8 +1,13 @@
 {
-  "devDependencies": {
-    "wrangler": "^4.149.0"
-  },
+  "name": "caffi-checkin-bot",
+  "version": "1.0.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "description": "Telegram bot that logs into the Caffi app and checks in at midnight Vietnam time",
   "dependencies": {
-    "grammy": "^1.46.0"
+    "grammy": "1.46.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
   }
 }
