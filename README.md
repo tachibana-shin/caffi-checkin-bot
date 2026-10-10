@@ -262,27 +262,36 @@ Those two specs must stay identical to `preRollCronSpec()` / `catchUpCronSpec()`
 ### First deploy
 
 ```bash
-# 1. Bindings and non-secret config live in wrangler.toml. Secrets do not:
+# 1. The repo is linked to the Worker (Workers Builds):
+#    dash.cloudflare.com → Workers → caffi-checkin-bot → Settings → Builds →
+#    Connect. Branch main, build command `bun install`, deploy command
+#    `bunx wrangler deploy`. Every push to main then builds and ships itself.
+#
+#    A one-off still works from a checkout:
+bunx wrangler deploy
+
+# 2. Secrets live on the Worker, never in the repo:
 bunx wrangler secret put TELEGRAM_BOT_TOKEN
 bunx wrangler secret put BOT_SECRET
 bunx wrangler secret put PUBLIC_URL        # https://<worker>.<subdomain>.workers.dev
 bunx wrangler secret put WORKER_SECRET     # defaults to BOT_SECRET when unset
 
-# 2. The state store: a D1 database, in the region nearest the API it talks to.
+# 3. The state store: a D1 database in the region nearest the API it talks to.
 bunx wrangler d1 create caffi --location apac
 bunx wrangler d1 execute caffi --remote \
   --command "CREATE TABLE IF NOT EXISTS records (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 
-# 3. Move an existing store over. The records are copied byte for byte — still sealed
-#    with BOT_SECRET, so the Worker opens them with the round count recorded inside
-#    the envelope. scripts/kv-backup.ts dumps the old host; d1-seed.ts writes them in.
+# 4. Move an existing store over. The records are copied byte for byte — still
+#    sealed with BOT_SECRET, so the Worker opens them with the round count
+#    recorded inside the envelope. kv-backup.ts dumps the old host, d1-seed.ts
+#    writes them in.
 deno run -A scripts/kv-backup.ts <database-id> /tmp/store.json     # from the old host
 deno run -A scripts/d1-seed.ts /tmp/store.json /tmp/seed.sql
 bunx wrangler d1 execute caffi --remote --file /tmp/seed.sql
-
-# 4. Ship it. CI deploys on every push to main; a one-off works too:
-bunx wrangler deploy
 ```
+
+The build image ships **bun 1.2**, which cannot read the lockfile a newer bun writes, so `bun.lock`
+is not committed — the two dependencies are pinned in `package.json` instead.
 
 **The round count matters.** A Worker's free plan bills **10ms of CPU per invocation** and PBKDF2 at
 the rounds the store was originally sealed with (150,000 → ~1s) exceeds it by two orders of
