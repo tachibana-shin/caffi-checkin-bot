@@ -1,7 +1,6 @@
 {
   "version": "5",
   "specifiers": {
-    "npm:@discordeno/bot@21": "21.0.0",
     "npm:grammy@^1.46.0": "1.46.0"
   },
   "npm": {
@@ -99,8 +98,13 @@
   },
   "workspace": {
     "dependencies": [
-      "npm:@discordeno/bot@21",
       "npm:grammy@^1.46.0"
-    ]
+    ],
+    "packageJson": {
+      "dependencies": [
+        "npm:grammy@^1.46.0",
+        "npm:wrangler@^4.149.0"
+      ]
+    }
   }
 }

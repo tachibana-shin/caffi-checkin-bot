@@ -1,12 +1,13 @@
 import { seal, unseal } from "./crypto.ts";
 import { config } from "./config.ts";
+import { d1Store, kvStore, type RecordStore } from "./records.ts";
 import type { Account, ChatState, StoreData } from "./types.ts";
 
 /**
- * The whole bot state lives in **one Deno KV record**, not in a file: Deno
- * Deploy has no writable filesystem, and the platform provisions a KV
- * instance instead. Locally the very same API backs onto `store.kv` inside
- * `DATA_DIR`, so `deno task start` behaves exactly as before.
+ * The whole bot state lives in **one record**, not in a file: no host the bot
+ * runs on has a writable filesystem, so the platform provisions one instead
+ * (Deno KV on Deno Deploy, D1 on Cloudflare Workers, a local KV file for
+ * development). `records.ts` hides which.
  *
  * The payload keeps the old shape (`{"payload": ...}` when encrypted), which
  * means a `store.json` written by an earlier version migrates on first load.
@@ -18,20 +19,33 @@ function emptyStore(): StoreData {
   return { version: 1, chats: {} };
 }
 
-async function openKv(): Promise<Deno.Kv> {
-  if (config.deploy) return await Deno.openKv(); // provisioned by Deno Deploy
+/**
+ * The D1 binding, when the runtime handed us one. On workerd this is the only
+ * state store available; everywhere else it is absent and `openRecords` falls
+ * back to Deno KV.
+ */
+function workerDb(): RecordStore | undefined {
+  // Set by `src/worker.ts` before anything imports the config.
+  const g = globalThis as { __caffiDb?: import("./records.ts").D1Like };
+  return g.__caffiDb ? d1Store(g.__caffiDb) : undefined;
+}
+
+async function openRecords(): Promise<RecordStore> {
+  const db = workerDb();
+  if (db) return db; // Cloudflare Workers
+  if (config.runtimeMode === "webhook") return kvStore(await Deno.openKv()); // Deno Deploy
   try {
     await Deno.mkdir(config.dataDir, { recursive: true });
-    return await Deno.openKv(`${config.dataDir}/store.kv`);
+    return kvStore(await Deno.openKv(`${config.dataDir}/store.kv`));
   } catch {
     // Not a place where a KV file can live (e.g. a read-only working dir).
-    return await Deno.openKv();
+    return kvStore(await Deno.openKv());
   }
 }
 
-/** Reads the pre-KV `store.json`, if there is one. Missing on Deno Deploy. */
+/** Reads the pre-KV `store.json`, if there is one. Missing on every serverless host. */
 async function readLegacyFile(): Promise<string | null> {
-  if (config.deploy) return null;
+  if (config.runtimeMode === "webhook" || config.runtimeMode === "worker") return null;
   try {
     return await Deno.readTextFile(`${config.dataDir}/store.json`);
   } catch {
@@ -56,7 +70,7 @@ export class Store {
   #dirty = false;
   #loaded = false;
   #timer: ReturnType<typeof setTimeout> | undefined;
-  #kv: Deno.Kv | undefined;
+  #records: RecordStore | undefined;
 
   get encrypted(): boolean {
     return config.secret.length > 0;
@@ -69,10 +83,10 @@ export class Store {
   /** Loads once; later calls (cron + HTTP in the same isolate) are a no-op. */
   async load(): Promise<void> {
     if (this.#loaded) return;
-    const kv = await openKv();
-    this.#kv = kv;
+    const records = await openRecords();
+    this.#records = records;
 
-    const stored = (await kv.get<string>(STORE_KEY)).value;
+    const stored = await records.get<string>(STORE_KEY);
     if (stored !== null) {
       this.#data = await decode(stored) ?? emptyStore();
       this.#loaded = true;
@@ -82,8 +96,8 @@ export class Store {
     const legacy = await readLegacyFile();
     if (legacy !== null) {
       this.#data = await decode(legacy) ?? emptyStore();
-      await kv.set(STORE_KEY, legacy);
-      console.log(`🚚 Migrated ${config.dataDir}/store.json into Deno KV`);
+      await records.set(STORE_KEY, legacy);
+      console.log(`🚚 Migrated ${config.dataDir}/store.json into the store`);
     } else if (config.storeImport) {
       // One-shot hand-over for a host with no file to migrate from (Deno
       // Deploy): `store.json` arrives as an env var, byte for byte the payload
@@ -91,12 +105,14 @@ export class Store {
       // cannot be decrypted yet so the ciphertext survives until the secret
       // is right — `decode` runs again on every boot.
       const imported = await decode(config.storeImport);
-      await kv.set(STORE_KEY, config.storeImport);
+      await records.set(STORE_KEY, config.storeImport);
       this.#data = imported ?? emptyStore();
       console.log(
         imported
-          ? `🚚 Seeded Deno KV from STORE_IMPORT — ${Object.keys(this.#data.chats).length} chat(s)`
-          : "⚠️ STORE_IMPORT cannot be decrypted with BOT_SECRET — left in KV, starting empty",
+          ? `🚚 Seeded the store from STORE_IMPORT — ${
+            Object.keys(this.#data.chats).length
+          } chat(s)`
+          : "⚠️ STORE_IMPORT cannot be decrypted with BOT_SECRET — left in the store, starting empty",
       );
     } else {
       this.#data = emptyStore();
@@ -143,17 +159,17 @@ export class Store {
 
   /**
    * Cross-instance coordination. Deno Deploy runs several isolated copies of
-   * the app, so anything "register this once" (the webhook URL, Discord's
-   * slash-command list) is remembered here instead of in a module variable.
+   * the app, so anything "register this once" (the webhook URL) is remembered
+   * here instead of in a module variable.
    */
   async meta<T>(key: string): Promise<T | undefined> {
-    if (!this.#kv) return undefined;
-    return (await this.#kv.get<T>([...META_KEY, key])).value ?? undefined;
+    if (!this.#records) return undefined;
+    return (await this.#records.get<T>([...META_KEY, key])) ?? undefined;
   }
 
   async setMeta<T>(key: string, value: T): Promise<void> {
-    if (!this.#kv) return;
-    await this.#kv.set([...META_KEY, key], value);
+    if (!this.#records) return;
+    await this.#records.set([...META_KEY, key], value);
   }
 
   /** Mark the store as changed and schedule a debounced write (500ms). */
@@ -178,13 +194,13 @@ export class Store {
     }
     if (!this.#dirty) return;
     this.#dirty = false;
-    if (!this.#kv) return;
+    if (!this.#records) return;
 
     const payload = this.encrypted
       ? JSON.stringify({ payload: await seal(this.#data, config.secret) }, null, 2)
       : JSON.stringify(this.#data, null, 2);
 
-    await this.#kv.set(STORE_KEY, payload);
+    await this.#records.set(STORE_KEY, payload);
   }
 }
 

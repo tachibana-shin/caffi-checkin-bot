@@ -10,7 +10,7 @@ import { ensureWebhook, type Sender, webhookHandler } from "./telegram.ts";
 import "./cron.ts";
 
 /**
- * Both transports share the store, the scheduler and the command handlers —
+ * Both shapes share the store, the scheduler and the command handlers —
  * only delivery differs. `polling` is the local shape (grammY long polling +
  * Discord gateway + an interval scheduler); `webhook` is the Deno Deploy shape
  * (HTTP endpoint + `Deno.cron`), because Deno Deploy runs several isolated
@@ -118,7 +118,7 @@ export function registerHandlers(bot: Bot, tg: Sender) {
  * The handler is created once and reused — grammY's webhook adapter is a
  * closure over the bot, not a per-request factory.
  */
-async function startWebhook({ bot, discord }: Booted) {
+async function startWebhook({ bot }: Booted) {
   const telegram = webhookHandler(bot);
 
   if (config.publicUrl) {
@@ -134,10 +134,6 @@ async function startWebhook({ bot, discord }: Booted) {
     const { pathname } = new URL(req.url);
 
     if (pathname === "/telegram") return await telegram(req);
-    if (pathname === "/discord") {
-      if (!discord) return new Response("Discord is not configured", { status: 503 });
-      return await discord.handleInteractions(req);
-    }
     if (pathname === "/probe") {
       // TEMPORARY: how far this isolate is from the Caffi servers.
       const { apiFor } = await import("./checkin.ts");

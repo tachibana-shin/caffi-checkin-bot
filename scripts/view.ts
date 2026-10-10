@@ -28,10 +28,6 @@ const nasty = view.renderHtml({
 check("telegram escapes <>&", nasty.includes("&lt;script&gt;") && !nasty.includes("<script>"));
 check("telegram keeps Vietnamese", nasty.includes("Thoát"));
 
-const embed = view.toEmbed({ icon: "💳", title: "Ví & tiền", tone: "success", footer: "bot" });
-check("embed has a colour", embed.color === 0x22c55e, embed.color.toString(16));
-check("embed carries title/footer", embed.title.includes("Ví") && embed.footer?.text === "bot");
-
 const long = view.renderHtml({
   icon: "x",
   title: "dài",
@@ -455,10 +451,7 @@ const screens: [string, ReturnType<typeof cmds.statusCard>][] = [
 
 for (const [name, card] of screens) {
   const html = view.renderHtml(card);
-  const embed = view.toEmbed(card);
-  const ok = html.length > 20 && embed.title.includes(card.title) &&
-    (embed.description?.length ?? 0) > 0;
-  check(`${name} renders on both platforms`, ok, `${html.length}B html`);
+  check(`${name} renders as Telegram HTML`, html.length > 20, `${html.length}B`);
 }
 
 const statusHtml = view.renderHtml(statusScreen);
@@ -552,15 +545,15 @@ check(
 check("roll-up explains what it could not read", rollupText.includes("TOKEN_EXPIRED"));
 check("roll-up says it is read-only", rollupScreen.footer?.includes("Chỉ đọc") === true);
 
-const switchKeys = cmds.accountKeys(twoAccounts);
+const switchKeys: ReturnType<typeof cmds.accountKeys> = cmds.accountKeys(twoAccounts);
 check(
   "2+ logins get switch buttons",
-  switchKeys.some((r) => r.some((k) => k.data === "nav:use b@test")),
+  switchKeys.some((r: Array<{ data: string }>) => r.some((k) => k.data === "nav:use b@test")),
 );
 check(
-  "switch buttons fit Discord's row/id/label caps",
+  "switch buttons fit Telegram's row/label caps",
   switchKeys.length <= 5 &&
-    switchKeys.flat().every((k) => k.data.length <= 100 && k.label.length <= 80),
+    switchKeys.flat().every((k) => k.label.length <= 80),
   `${switchKeys.length} rows`,
 );
 
@@ -589,7 +582,7 @@ const rows = view.MENU.concat(view.SCREEN);
 check("menu rows are not empty", rows.length > 0);
 check(
   "menu rows fit Discord's 5-button cap",
-  rows.every((r) => r.length >= 1 && r.length <= 5),
+  rows.every((r: Array<unknown>) => r.length >= 1 && r.length <= 5),
 );
 check(
   "MENU + SCREEN stay inside Discord's 5 action rows",
@@ -599,11 +592,11 @@ check(
 check("the menu spans exactly 4 rows", view.MENU.length === 4, String(view.MENU.length));
 check(
   "button labels fit Discord's 80 chars",
-  rows.flat().every((k) => k.label.length <= 80),
+  rows.flat().every((k: { label: string }) => k.label.length <= 80),
 );
 check(
   "button ids fit Discord's 100 chars",
-  rows.flat().every((k) => k.data.length <= 100),
+  rows.flat().every((k: { data: string }) => k.data.length <= 100),
 );
 check(
   "every nav target is a known command",

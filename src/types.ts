@@ -37,8 +37,6 @@ export interface ChatState {
   pending?: PendingLogin;
   /** Which screen is open — lets the "Làm mới" button know what to redraw. */
   lastNav?: string;
-  /** DM channel id on Discord, captured so the scheduler can reach this user. */
-  discordDmChannelId?: string;
 }
 
 export interface StoreData {

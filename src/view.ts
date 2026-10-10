@@ -1,16 +1,15 @@
 /**
  * Platform-agnostic presentation layer.
  *
- * Handlers build a `Card`; the Telegram renderer turns it into HTML and the
- * Discord renderer into an embed. Nothing here touches the network or the
- * store, so every screen can be tested offline and both bots stay visually in
- * step.
+ * Handlers build a `Card`; the renderer turns it into Telegram HTML. Nothing
+ * here touches the network or the store, so every screen can be tested offline
+ * and the surfaces stay visually in step.
  *
  * Card content is always **plain text** — escaping is the renderer's job, so
  * callers never have to remember which platform needs what.
  */
 
-/** Drives the accent colour (Discord) and nothing else. */
+/** A card's tone; drives the accent colour. */
 export type Tone = "success" | "info" | "warn" | "error" | "gold";
 
 export interface Stat {
@@ -35,8 +34,7 @@ export interface Card {
   tone?: Tone;
   /**
    * Transient "working on it…" screen. Telegram shows it as a normal message;
-   * Discord defers instead, so the card is dropped there rather than flashed for
-   * a second and replaced.
+   * the card is flashed for a few hundred milliseconds and then replaced.
    */
   progress?: boolean;
 }
@@ -50,15 +48,7 @@ export interface Key {
 /** Buttons, row by row. */
 export type KeyRows = Key[][];
 
-const TONE_COLOR: Record<Tone, number> = {
-  success: 0x22c55e,
-  info: 0x3b82f6,
-  warn: 0xf59e0b,
-  error: 0xef4444,
-  gold: 0xfacc15,
-};
-
-/** Telegram hard-caps a message at 4096 characters; Discord's embed at 4096 too. */
+/** Telegram hard-caps a message at 4096 characters. */
 const MAX_LEN = 4000;
 
 // ── Shared formatting ──────────────────────────────────────────────────────
@@ -138,7 +128,6 @@ export function escapeHtml(s: string): string {
 }
 
 /**
- * Discord markdown: the characters below would otherwise start formatting.
  * Backslash must go first so later escapes are not re-escaped.
  */
 export function escapeMarkdown(s: string): string {
@@ -186,52 +175,6 @@ function trimHtml(html: string): string {
   return `${cut}\n…`;
 }
 
-// ── Discord ────────────────────────────────────────────────────────────────
-
-/**
- * The subset of Discord's embed object we use. Kept local so this module has no
- * dependency on discordeno — `discord.ts` feeds it straight into `embeds`.
- */
-export interface EmbedLike {
-  title: string;
-  description?: string;
-  color: number;
-  footer?: { text: string };
-}
-
-/** Render a card as a Discord embed. */
-export function toEmbed(card: Card): EmbedLike {
-  const out: string[] = [];
-  if (card.subtitle) out.push(`*${escapeMarkdown(card.subtitle)}*`);
-
-  if (card.stats?.length) {
-    out.push("");
-    for (const s of card.stats) {
-      out.push(`**${escapeMarkdown(s.label)}:** ${escapeMarkdown(s.value)}`);
-    }
-  }
-
-  for (const b of card.blocks ?? []) {
-    if (!b.text) continue;
-    out.push("");
-    if (b.heading) out.push(`**${escapeMarkdown(b.heading)}**`);
-    if (b.mono) {
-      // A fence inside the text would close the block early.
-      out.push(`\`\`\`\n${b.text.replace(/```/g, "'\"'\"'")}\n\`\`\``);
-    } else {
-      out.push(escapeMarkdown(b.text));
-    }
-  }
-
-  const embed: EmbedLike = {
-    title: `${card.icon} ${card.title}`,
-    color: TONE_COLOR[card.tone ?? "info"],
-    description: out.join("\n").slice(0, 4000) || undefined,
-  };
-  if (card.footer) embed.footer = { text: card.footer.slice(0, 2048) };
-  return embed;
-}
-
 // ── Plain text (console output, tests) ─────────────────────────────────────
 
 /** Render a card as plain text — used by scripts and test assertions. */
@@ -251,10 +194,10 @@ export function renderPlain(card: Card): string {
 
 /**
  * The button grid shown under `/help` and `/start`. Both platforms render it —
- * Telegram as an inline keyboard, Discord as an action row of buttons.
+ * Telegram renders the grid as an inline keyboard.
  *
- * Exactly **4 rows**: `SCREEN` adds a fifth, and Discord allows five action
- * rows per message and five buttons per row.
+ * Exactly **4 rows**: `SCREEN` adds a fifth, and Telegram allows five button
+ * rows per message and eight buttons per row.
  */
 export const MENU: KeyRows = [
   [

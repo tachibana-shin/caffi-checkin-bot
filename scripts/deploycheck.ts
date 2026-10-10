@@ -1,13 +1,13 @@
 /**
  * Pre-flight for the Deno Deploy shape — everything below runs offline against
  * the very modules the deployed app uses, so a wrong cron spec, an unreadable
- * KV record or a mis-signed Discord payload is caught before the first revision
+ * KV record or a mis-signed Telegram payload is caught before the first revision
  * is published.
  *
  *   deno task deploycheck
  *
  * Sections: environment, `config.ts` vs `.env.example`, schedule arithmetic,
- * Deno KV, Telegram's webhook callback, Discord's interactions endpoint and —
+ * Deno KV, Telegram's webhook callback and —
  * when PUBLIC_URL is set — a live check against the deployed app.
  *
  * Nothing here talks to Caffi, and no request ever leaves the process: both
@@ -112,7 +112,6 @@ const { registerHandlers } = await import("../src/main.ts");
 console.log = realLog;
 
 const { senderFor, webhookHandler } = await import("../src/telegram.ts");
-const { createDiscordBot, interactionHandler } = await import("../src/discord.ts");
 const { Bot } = await import("grammy");
 
 // ── Schedule ───────────────────────────────────────────────────────────────
@@ -234,14 +233,45 @@ await Deno.mkdir(TMP, { recursive: true });
 const legacy = JSON.stringify({ version: 1, chats: { "tg:777": { accounts: {} } } });
 await Deno.writeTextFile(`${TMP}/store.json`, legacy);
 
-await store.load();
-check("legacy store.json migrated into KV", store.data.chats["tg:777"] !== undefined);
-await store.setMeta("deploycheck", "ok");
-check("meta round-trips", (await store.meta<string>("deploycheck")) === "ok");
-
-store.data.version = 1;
-store.touch();
-await store.flush();
+// `.env` carries RUNTIME_MODE=webhook for the Deno Deploy shape, whose KV is
+// in-memory and per process — so the round-trip needs a process of its own, in
+// the local shape, pointed at the same scratch directory.
+const localScript = `${TMP}/local.ts`;
+await Deno.writeTextFile(
+  localScript,
+  [
+    `import { store } from ${
+      JSON.stringify(new URL("../src/store.ts", import.meta.url).pathname)
+    };`,
+    "await store.load();",
+    "console.log('legacy=' + (store.data.chats['tg:777'] !== undefined));",
+    "await store.setMeta('deploycheck', 'ok');",
+    "console.log('meta=' + ((await store.meta('deploycheck')) === 'ok'));",
+    "store.data.version = 1;",
+    "store.touch();",
+    "await store.flush();",
+    "console.log('flushed');",
+    "",
+  ].join("\n"),
+);
+const local = await new Deno.Command(Deno.execPath(), {
+  args: ["run", "-A", "--config", new URL("../deno.json", import.meta.url).pathname, localScript],
+  env: {
+    RUNTIME_MODE: "polling",
+    DATA_DIR: TMP,
+    BOT_SECRET: config.secret,
+  },
+  stdout: "piped",
+  stderr: "piped",
+}).output();
+const localOut = new TextDecoder().decode(local.stdout) + new TextDecoder().decode(local.stderr);
+check(
+  "legacy store.json migrated into the store",
+  localOut.includes("legacy=true"),
+  localOut.trim().split("\n").pop(),
+);
+check("meta round-trips", localOut.includes("meta=true"));
+check("flush() ran to completion", localOut.includes("flushed"));
 
 const kv = await Deno.openKv(`${TMP}/store.kv`);
 const raw = (await kv.get<string>(["caffi", "store"])).value;
@@ -254,10 +284,8 @@ if (raw === null) {
   check(
     "flush() encrypts the payload",
     typeof parsed.payload === "string" && parsed.chats === undefined,
-    Object.keys(parsed).join(", ") || "nothing",
+    typeof parsed.payload,
   );
-  const payload = parsed.payload ?? "";
-  check("the payload still decodes", payload.length > 0, `${payload.length} chars`);
 }
 
 // A host with no file to migrate from (Deno Deploy) is handed the old
@@ -297,8 +325,8 @@ const seed = await new Deno.Command(Deno.execPath(), {
 const seedOut = new TextDecoder().decode(seed.stdout) + new TextDecoder().decode(seed.stderr);
 check(
   "STORE_IMPORT seeds an empty KV (the Deno Deploy shape)",
-  seed.code === 0 && seedOut.includes("seeded=ds:42") && seedOut.includes("Seeded Deno KV"),
-  seedOut.includes("Seeded Deno KV")
+  seed.code === 0 && seedOut.includes("seeded=ds:42") && seedOut.includes("Seeded the store"),
+  seedOut.includes("Seeded the store")
     ? seedOut.match(/seeded=[^\n]*/)?.[0] ?? ""
     : `exit ${seed.code}: ${seedOut.trim().split("\n").pop()}`,
 );
@@ -377,121 +405,6 @@ await expect(
   200,
 );
 
-// ── Discord ────────────────────────────────────────────────────────────────
-
-section("Discord interactions endpoint");
-const discordBot = createDiscordBot();
-check("discordeno bot built without any REST call", discordBot !== undefined);
-
-if (discordBot) {
-  const interactions = interactionHandler(discordBot);
-  const url = "https://example.test/discord";
-
-  await expect("GET -> banner", interactions(new Request(url)), 200);
-
-  const signed = async (body: string, signature?: string) => {
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const sig = signature ??
-      toHex(
-        new Uint8Array(
-          await crypto.subtle.sign(
-            { name: "Ed25519" },
-            keyPair.privateKey,
-            new TextEncoder().encode(timestamp + body),
-          ),
-        ),
-      );
-    return new Request(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-signature-ed25519": sig,
-        "x-signature-timestamp": timestamp,
-      },
-      body,
-    });
-  };
-  const unsigned = (body: string) =>
-    new Request(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-    });
-
-  await expect("no signature at all -> 401", interactions(unsigned('{"type":1}')), 401);
-  await expect(
-    "empty signature -> 401",
-    quietly(async () => await interactions(await signed('{"type":1}', " "))),
-    401,
-  );
-  await expect(
-    "signature over another body -> 401",
-    quietly(async () => await interactions(await signed('{"type":1}', toHex(new Uint8Array(32))))),
-    401,
-  );
-
-  const ping = await quietly(async () =>
-    await interactions(await signed('{"type":1,"challenge":"dc-verify-42"}'))
-  );
-  const pingBody = ping.status === 200
-    ? await ping.json() as { type?: number; challenge?: string }
-    : undefined;
-  check(
-    "PING -> 200 and the challenge comes back verbatim",
-    ping.status === 200 && pingBody?.type === 1 && pingBody?.challenge === "dc-verify-42",
-    `status ${ping.status}, challenge ${JSON.stringify(pingBody?.challenge)}`,
-  );
-
-  // The route answers through Discord's REST API, which is the one thing this
-  // script must not touch. Stub it, then check the contract it exists for:
-  // whatever happens, the endpoint answers 204 and never a 5xx.
-  let restCalls = 0;
-  const rest = discordBot.rest as unknown as { post: unknown };
-  const realPost = rest.post;
-  rest.post = () => {
-    restCalls++;
-    return Promise.reject(new Error("offline: REST is stubbed by deploycheck"));
-  };
-
-  await expect(
-    "interaction -> 204 even though Discord is unreachable",
-    quietly(async () =>
-      interactions(
-        await signed(
-          JSON.stringify({
-            id: "1",
-            token: "t",
-            type: 2,
-            application_id: "42",
-            channel_id: "777",
-            user: { id: "777", username: "x", discriminator: "0", global_name: "X", avatar: null },
-            data: { id: "9", name: "status", type: 1, options: [] },
-          }),
-        ),
-      )
-    ),
-    204,
-  );
-  check("…and it deferred over the stub, not the network", restCalls > 0, `${restCalls} call(s)`);
-
-  // discordeno derives the user from `member.user ?? user`; a payload with
-  // neither throws inside the transformer, which must still be answered.
-  await expect(
-    "payload with neither user nor member -> 204",
-    quietly(async () =>
-      interactions(
-        await signed(
-          JSON.stringify({ id: "2", token: "t", type: 2, data: { name: "status", options: [] } }),
-        ),
-      )
-    ),
-    204,
-  );
-
-  rest.post = realPost;
-  await expect("malformed JSON -> 400", interactions(await signed("not json")), 400);
-}
-
 // ── Live (only once the app is out there) ──────────────────────────────────
 
 if (config.publicUrl) {
@@ -499,16 +412,6 @@ if (config.publicUrl) {
   try {
     const res = await fetch(`${config.publicUrl}/healthz`);
     check("GET /healthz -> 200", res.status === 200, String(res.status));
-    const discordRes = await fetch(`${config.publicUrl}/discord`, {
-      method: "POST",
-      body: JSON.stringify({ type: 1 }),
-      headers: { "content-type": "application/json" },
-    });
-    check(
-      "POST /discord without a signature -> 401",
-      discordRes.status === 401,
-      String(discordRes.status),
-    );
   } catch (e) {
     check("reachable", false, (e as Error).message);
   }

@@ -1,0 +1,41 @@
+name: deploy
+
+# The bot lives on a Cloudflare Worker. Every push to main builds and ships it,
+# the same way the GitHub integration used to do on Deno Deploy.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: vx.x.x
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: deno task check
+      - run: deno task lint
+      - run: deno fmt --check
+      # The offline suites need no secrets; `deploycheck`'s live probes are skipped
+      # because PUBLIC_URL is not in the environment here.
+      - run: deno task timing
+      - run: deno task view
+      - run: deno task wiring
+      - run: deno task batch
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx wrangler deploy
+        env:
+          # An API token with "Edit Cloudflare Workers" — add it to the repo secrets.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

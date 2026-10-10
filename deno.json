@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "license": "GPL-3.0-only",
   "exports": "./src/main.ts",
-  "unstable": ["kv", "cron"],
+  "unstable": [
+    "kv",
+    "cron"
+  ],
   "tasks": {
     "start": "deno run -A --env-file=.env src/main.ts",
     "dev": "deno run -A --env-file=.env --watch src/main.ts",
@@ -16,7 +19,6 @@
     "view": "deno run -A scripts/view.ts",
     "wiring": "deno run -A scripts/wiring.ts",
     "deploycheck": "deno run -A --env-file=.env scripts/deploycheck.ts",
-    "logo": "deno run -A --env-file=.env scripts/logo.ts",
     "fmt": "deno fmt"
   },
   "compilerOptions": {
@@ -29,7 +31,6 @@
     "singleQuote": false
   },
   "imports": {
-    "@discordeno/bot": "npm:@discordeno/bot@^21.0.0",
     "grammy": "npm:grammy@^1.46.0"
   },
   "deploy": {

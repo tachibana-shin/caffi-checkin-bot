@@ -1,0 +1,8 @@
+{
+  "devDependencies": {
+    "wrangler": "^4.149.0"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0"
+  }
+}

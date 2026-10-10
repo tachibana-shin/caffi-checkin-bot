@@ -1,0 +1,36 @@
+name = "caffi-checkin-bot"
+main = "src/worker.ts"
+compatibility_date = "2026-10-01"
+
+# The Caffi API is a single VNPT address in Vietnam (222.255.215.152), not
+# anycast, so Cloudflare can triangulate it. Placement Matters here: without it
+# the isolate sits nearest whoever woke it up — `ord`/`ams` measured ~265ms to
+# Vietnam, which is larger than the whole midnight race. Placed, the isolate
+# runs in the colo closest to the Caffi servers.
+#
+# Placement only applies to *fetch* handlers, so the cron handler does not call
+# the API itself: it wakes `/race` over HTTP and the work happens there.
+[placement]
+hostname = "client-api.caffiliate.vn"
+
+[[d1_databases]]
+binding = "caffi"
+database_name = "caffi"
+database_id = "81920473-d963-4062-9c41-3319364d3de4"
+
+# Both jobs are UTC (Vietnam is UTC+7, no DST). They must stay identical to
+# `preRollCronSpec()` / `catchUpCronSpec()` in src/scheduler.ts — `deno task
+# deploycheck` and scripts/check-cron.ts fail the build when they drift.
+[triggers]
+crons = ["56 16 * * *", "28 17 * * *"]
+
+# Non-secret configuration. Anything sensitive (BOT_SECRET, the Telegram and
+# Discord tokens) goes in `wrangler secret put`.
+[vars]
+RUNTIME_MODE = "worker"
+CHECKIN_HOUR = "0"
+CHECKIN_MINUTE = "0"
+CHECKIN_EARLY_SECONDS = "5"
+CHECKIN_MAX_WAIT_SECONDS = "600"
+DATA_DIR = "data"
+KDF_ITERATIONS = "1000"

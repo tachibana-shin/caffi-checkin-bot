@@ -3,29 +3,28 @@
 **Source:**
 [github.com/tachibana-shin/caffi-checkin-bot](https://github.com/tachibana-shin/caffi-checkin-bot) ·
 **Live:**
-[caffi-checkin-bot.tachibana-shin.deno.net](https://caffi-checkin-bot.tachibana-shin.deno.net) ·
+[caffi-checkin-bot.tachibshin.workers.dev](https://caffi-checkin-bot.tachibshin.workers.dev) ·
 **License:** [GNU GPL v3.0](LICENSE)
 
-A Telegram **and** Discord bot that logs into the **Caffi** app (`vn.caffiliate.customer`) with a
-username/password + OTP and performs the daily check-in at **00:00 (midnight) Vietnam time**. When
-the server drops the session, the bot messages you to log in again.
+A Telegram bot that logs into the **Caffi** app (`vn.caffiliate.customer`) with a username/password
 
-The transports are [grammY](https://grammy.dev) for Telegram and
-[discordeno](https://discordeno.js.org) for Discord — long polling, retries, offsets and 409
-conflict handling all come from the libraries. Both sides share one command layer
-(`src/commands.ts`), one store and one scheduler; only the delivery differs.
+- OTP and performs the daily check-in at **00:00 (midnight) Vietnam time**. When the server drops
+  the session, the bot messages you to log in again.
 
-It runs in two shapes, picked by `RUNTIME_MODE` in [`src/config.ts`](src/config.ts): **polling**
-(the default locally) is grammY long polling + the Discord gateway + a `data/store.kv` file;
-**webhook** (the default as soon as `DENO_DEPLOY=true`) serves `POST /telegram` and `POST /discord`
-from `Deno.serve`, keeps the state in Deno KV and hands the schedule to `Deno.cron`. The command
-layer and the check-in arithmetic are the same in both — see
-[Deploying to Deno Deploy](#deploying-to-deno-deploy).
+The transport is [grammY](https://grammy.dev) — long polling, retries, offsets and 409 conflict
+handling all come from the library. One command layer (`src/commands.ts`), one store and one
+scheduler; only the delivery differs.
 
-**Anyone can use the bot.** Every chat is keyed by its own id (`tg:<chat>` / `ds:<user>`), so each
-person manages exactly one set of accounts and can never see another user's data. On Discord every
-reply is ephemeral, and the `/login` family is restricted to DMs so credentials never land in a
-server channel.
+It runs in three shapes, picked by `RUNTIME_MODE` in [`src/config.ts`](src/config.ts):
+
+| shape     | where it runs         | transport                          | state                 | schedule                         |
+| --------- | --------------------- | ---------------------------------- | --------------------- | -------------------------------- |
+| `polling` | `deno task start`     | grammY long polling                | `data/store.kv`       | interval in `scheduler.ts`       |
+| `webhook` | Deno Deploy (retired) | `POST /telegram` from `Deno.serve` | Deno KV               | `Deno.cron`                      |
+| `worker`  | Cloudflare Workers    | `POST /telegram` from `fetch()`    | D1 (`src/records.ts`) | `scheduled` → self-`fetch /race` |
+
+**Anyone can use the bot.** Every chat is keyed by its own id (`tg:<chat>`), so each person manages
+exactly one set of accounts and can never see another user's data.
 
 ## Where the API came from
 
@@ -173,40 +172,16 @@ deno task start
 openssl rand -hex 32
 ```
 
-### Adding Discord
-
-1. Create an application at <https://discord.com/developers/applications> and add a **bot**.
-2. Copy the bot token into `DISCORD_TOKEN` (the application id is optional — it is derived from the
-   token). Invite the bot with the `bot` scope and the `applications.commands` scope.
-3. Restart. On start-up the bot pushes its slash commands globally; Discord can take up to an hour
-   to show them the first time.
-4. Only for the webhook shape (Deno Deploy): copy **General Information → Public Key** into
-   `DISCORD_PUBLIC_KEY` and set **Interactions Endpoint URL** to `PUBLIC_URL/discord`. Discord signs
-   a PING with that public key and wants its `challenge` echoed back — when the handshake fails the
-   slash commands stay dead while everything else still looks fine, so it is worth checking the logs
-   for `[discord] ping from Discord`.
-
-With `DISCORD_TOKEN` empty the Discord side is skipped entirely.
-
 ## Bot identity
 
-```bash
-deno task logo   # name + description on Telegram, avatar + application icon on Discord
-```
-
-Everything comes from `assets/logo.png`, the icon lifted out of the APK. The script sets the names
-and descriptions on both platforms plus the Discord **bot avatar** (the picture people actually see
-in a chat). Two more pictures have to go up by hand — neither API exposes them:
+`assets/logo.png` is the icon lifted out of the APK.
 
 - **Telegram photo** — the Bot API has no call for a bot's own picture. Send `assets/logo.png` to
   @BotFather and run `/setuserpic` there.
-- **Discord application icon** — `PATCH /oauth2/applications/@me` wants a _user_ token and answers a
-  bot token with `403 Bots cannot use this endpoint`. Developer Portal → General Information → App
-  Icon → upload `assets/logo.png` (512×512 PNG).
 
 ## Using the bot
 
-Both platforms understand the same commands:
+The commands:
 
 ```
 /help                              ← the menu (Telegram also shows buttons)
@@ -227,7 +202,7 @@ Both platforms understand the same commands:
 /deals [id]                        ← community deals, or one deal with its comments
 /saved                             ← bookmarks + purchase reminders
 /shops                             ← the shops the link router supports
-/login <user> <password>           ← log in (Discord: DM only)
+/login <user> <password>           ← log in (private chat only)
 123456 /otp 123456                 ← enter the OTP
 /resend                            ← request a new code
 /cancel                            ← abandon a pending OTP session
@@ -248,83 +223,85 @@ Each chat can hold **several accounts**; switch the active one with `/use <name>
   logout. "Re-login automatically" is impossible without storing the password.
 - Data is stored **per chat id**. There is no allowlist and no shared state: `/accounts`, `/wallet`
   and everything else only ever read the caller's own records.
-- Discord replies are ephemeral, and `/login`, `/otp`, `/resend` and `/cancel` are hidden outside
-  DMs, so a password typed in a server channel cannot even be submitted.
-- Without `BOT_SECRET` the store is written **plaintext** — the bot warns about it. On Deno Deploy
-  the payload is sealed the same way before it reaches Deno KV.
-- Locally everything lives in `data/` — do not commit it. On Deno Deploy the same records live in
-  Deno KV, attached to the app.
+- Replies are private to the chat they came from, and the login family only runs in a private chat,
+  so a password typed in a group cannot even be submitted.
+- Without `BOT_SECRET` the store is written **plaintext** — the bot warns about it. The payload is
+  sealed the same way before it reaches the store, whatever the backend.
+- Locally everything lives in `data/` — do not commit it. On the serverless hosts the same records
+  live in the platform's own KV/D1, sealed with `BOT_SECRET`.
 
-## Deploying to Deno Deploy
+## Deploying to Cloudflare Workers
 
-Deno Deploy has no writable filesystem and no single long-lived process, so there the bot runs
-`RUNTIME_MODE=webhook` (`src/main.ts`):
+The bot lives on a Cloudflare Worker (`RUNTIME_MODE=worker`, entry point
+[`src/worker.ts`](src/worker.ts)). Workers has no writable filesystem and no long-lived process, so
+the same three splits apply as they did on Deno Deploy — HTTP in, state in a database, schedule in a
+cron trigger — and `src/records.ts` hides which database is behind the store:
 
-|          | local (`deno task start`)                  | Deno Deploy                                                 |
+|          | local (`deno task start`)                  | Cloudflare Worker                                           |
 | -------- | ------------------------------------------ | ----------------------------------------------------------- |
 | Telegram | grammY long polling                        | `POST /telegram`, `X-Telegram-Bot-Api-Secret-Token` checked |
-| Discord  | gateway                                    | `POST /discord`, Ed25519 over `timestamp + body`            |
-| state    | `data/store.kv` (`store.json` before that) | Deno KV, one record under `["caffi", "store"]`              |
-| schedule | timers in `src/scheduler.ts`               | two `Deno.cron` jobs from `src/cron.ts`                     |
+| state    | `data/store.kv` (`store.json` before that) | one row in D1, key `caffi store`                            |
+| schedule | timers in `src/scheduler.ts`               | `scheduled` → self-`fetch /race` → the same runner          |
 
-The handler still naps to the exact second (`msUntilWindow`), so the cron only has to wake an
-isolate _near_ the window: `caffi-checkin-pre-roll` at `56 16 * * *` UTC (23:56 VN) and
-`caffi-checkin-catch-up` at `28 17 * * *` UTC (00:28 VN). The pre-roll deliberately fires **three
-minutes early**: Deno Deploy documents that "the exact invocation time of your `Deno.cron` handler
-may vary by up to a minute from the scheduled time", and a spec in the minute right before midnight
-leaves less than a minute of slack for that jitter. On 2026-10-08 the job started at 00:00:02
-instead of 23:59:00, so the isolate opened the connection _after_ the day had turned and the
-check-in landed on second 6. The catch-up run no-ops when the pre-roll already finished, so a
-redeploy in the middle of the window cannot check in twice.
+### Why the cron handler fetches itself
+
+**Smart Placement** holds a Worker in the Cloudflare colo closest to the origin it calls, and the
+Caffi API is a single VNPT address in Vietnam (`222.255.215.152`) that Cloudflare can triangulate.
+That matters more than it sounds: Deno Deploy ran in `ord`/`ams`, which measured **265ms** to the
+Caffi servers — larger than the whole midnight race — and the placement the Worker gets instead
+measured **52ms**. But placement only applies to **fetch** handlers, so the cron handler never calls
+the API itself: it wakes `/race` over HTTP and the check-in runs inside a placed fetch.
+
+```
+[triggers] crons = ["56 16 * * *", "28 17 * * *"]   # 23:56 and 00:28 Vietnam
+```
+
+Those two specs must stay identical to `preRollCronSpec()` / `catchUpCronSpec()` in
+`src/scheduler.ts`; `deno task deploycheck` fails the build when they drift.
 
 ### First deploy
 
 ```bash
-# 1. Environment. `DENO_*` names are rejected — the platform owns that prefix
-#    and sets DENO_DEPLOY itself.
-cat > /tmp/app.env <<'EOF'
-TELEGRAM_BOT_TOKEN=...
-BOT_SECRET=...
-DISCORD_TOKEN=...
-DISCORD_APPLICATION_ID=...
-DISCORD_PUBLIC_KEY=...
-PUBLIC_URL=https://<app>.<org>.deno.net
-RUNTIME_MODE=webhook
-EOF
-deno deploy env load /tmp/app.env --replace --org <org> --app <app>
+# 1. Bindings and non-secret config live in wrangler.toml. Secrets do not:
+bunx wrangler secret put TELEGRAM_BOT_TOKEN
+bunx wrangler secret put BOT_SECRET
+bunx wrangler secret put PUBLIC_URL        # https://<worker>.<subdomain>.workers.dev
+bunx wrangler secret put WORKER_SECRET     # defaults to BOT_SECRET when unset
 
-# 2. A KV database to attach — the plan allows one, so an existing one may have
-#    to be shared (the keys are namespaced under "caffi").
-deno deploy database assign <db> --org <org> --app <app>
+# 2. The state store: a D1 database, in the region nearest the API it talks to.
+bunx wrangler d1 create caffi --location apac
+bunx wrangler d1 execute caffi --remote \
+  --command "CREATE TABLE IF NOT EXISTS records (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
 
-# 3. Ship it. The app is linked to the GitHub repo, so the normal way to ship is a push:
-git push origin main            # main is built and deployed to production automatically
-# A one-off without a commit still works:
-# deno deploy --prod --non-interactive --org <org> --app <app> .
+# 3. Move an existing store over. The records are copied byte for byte — still sealed
+#    with BOT_SECRET, so the Worker opens them with the round count recorded inside
+#    the envelope. scripts/kv-backup.ts dumps the old host; d1-seed.ts writes them in.
+deno run -A scripts/kv-backup.ts <database-id> /tmp/store.json     # from the old host
+deno run -A scripts/d1-seed.ts /tmp/store.json /tmp/seed.sql
+bunx wrangler d1 execute caffi --remote --file /tmp/seed.sql
+
+# 4. Ship it. CI deploys on every push to main; a one-off works too:
+bunx wrangler deploy
 ```
 
-Without step 2 the first boot dies with _"no KV database is attached to this app"_.
-
-**Bringing the accounts over.** There is no `data/store.json` on Deno Deploy, so the KV starts empty
-and every account has to be logged in again. To keep the ones you already have, hand the file over
-as an env var — it is still sealed with `BOT_SECRET`, so the platform only ever stores ciphertext:
+**The round count matters.** A Worker's free plan bills **10ms of CPU per invocation** and PBKDF2 at
+the rounds the store was originally sealed with (150,000 → ~1s) exceeds it by two orders of
+magnitude, so `unseal` would fail and the store would read as empty. `scripts/re-seal.ts` re-seals
+the record with `KDF_ITERATIONS` (1000, ~3ms) without touching the plaintext, and the round count
+travels inside the envelope so an old record still opens.
 
 ```bash
-deno deploy env add --secret STORE_IMPORT "$(tr -d '\n' < data/store.json)" \
-  --org <org> --app <app>
-deno deploy --prod ...        # boot logs "🚚 Seeded Deno KV from STORE_IMPORT — n chat(s)"
-deno deploy env remove STORE_IMPORT --org <org> --app <app>   # one shot, then drop it
+deno run -A scripts/re-seal.ts /tmp/store.json /tmp/reseal.sql
+bunx wrangler d1 execute caffi --remote --file /tmp/reseal.sql
 ```
-
-The branch only fires while the KV record is missing, so leaving the variable behind is harmless —
-but it goes stale, and removing it keeps one copy of the accounts instead of two.
 
 ### Checking a deployment
 
 ```bash
-deno task webhook status   # Telegram -> PUBLIC_URL/telegram, last error
-deno deploy logs --once --json --non-interactive --org <org> --app <app>
-deno task deploycheck      # offline pre-flight + live probes once PUBLIC_URL is set
+bunx wrangler tail                       # live logs
+bunx wrangler deployments list
+deno task webhook status                 # Telegram -> PUBLIC_URL/telegram, last error
+deno task deploycheck                    # offline pre-flight + live probes
 ```
 
 ## Running in the background
@@ -341,12 +318,11 @@ nohup deno task start > bot.log 2>&1 &
 deno task check         # type check
 deno task lint
 deno task timing        # offline: midnight window, poll cadence, check-in decision rules
-deno task view          # offline: every screen rendered as Telegram HTML + Discord embed
+deno task view          # offline: every screen rendered as Telegram HTML
 deno task wiring        # offline grammY routing test (no Telegram calls)
 deno task smoke         # store encryption round-trip + live API error branches
 deno task batch         # offline: the nightly batch — one watcher, POSTs together
-deno task deploycheck   # offline pre-flight for the Deno Deploy shape (+ live probes
-                        #  when PUBLIC_URL is in .env)
+deno task deploycheck   # offline pre-flight + live probes once PUBLIC_URL is in .env
 ```
 
 Live-account smoke scripts (manual, not part of CI):
