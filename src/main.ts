@@ -138,6 +138,20 @@ async function startWebhook({ bot, discord }: Booted) {
       if (!discord) return new Response("Discord is not configured", { status: 503 });
       return await discord.handleInteractions(req);
     }
+    if (pathname === "/probe") {
+      // TEMPORARY: how far this isolate is from the Caffi servers.
+      const { apiFor } = await import("./checkin.ts");
+      const targets = store.autoAccounts();
+      const out: string[] = [];
+      for (const { account } of targets.slice(0, 1)) {
+        for (let i = 0; i < 3; i++) {
+          const t = Date.now();
+          await apiFor(account).getCheckInStatus().catch((e) => String(e));
+          out.push(`${Date.now() - t}ms`);
+        }
+      }
+      return new Response(`caffi status rtt: ${out.join(", ")}`, { status: 200 });
+    }
     if (pathname === "/" || pathname === "/healthz") {
       return new Response("caffi check-in bot", { status: 200 });
     }
