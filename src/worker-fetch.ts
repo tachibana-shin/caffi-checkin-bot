@@ -19,6 +19,7 @@ export async function handleFetch(req: Request, _env: WorkerEnv): Promise<Respon
     return new Response("caffi check-in bot", { status: 200 });
   }
   if (pathname === "/probe") return await probe();
+  if (pathname === "/handle") return await handleNow(req);
   return new Response("Not found", { status: 404 });
 }
 

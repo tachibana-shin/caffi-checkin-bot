@@ -30,6 +30,9 @@ async function create(): Promise<Booted> {
   await store.load();
 
   const bot = createBot(config.botToken);
+  // grammY refuses to touch an update without `botInfo`, and `main.ts`'s
+  // `bot.init()` only exists in the Deno shapes. One `getMe` per isolate.
+  await bot.init();
   const tg = senderFor(bot);
 
   const fanOut: Sender = {

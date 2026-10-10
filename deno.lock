@@ -102,8 +102,8 @@
     ],
     "packageJson": {
       "dependencies": [
-        "npm:grammy@^1.46.0",
-        "npm:wrangler@^4.149.0"
+        "npm:grammy@1.46.0",
+        "npm:wrangler@4.149.0"
       ]
     }
   }

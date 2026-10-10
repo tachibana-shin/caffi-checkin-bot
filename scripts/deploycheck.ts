@@ -98,7 +98,6 @@ const { config } = await import("../src/config.ts");
 const { preRollCronSpec, catchUpCronSpec, msUntilWindow, planRun } = await import(
   "../src/scheduler.ts"
 );
-const { store } = await import("../src/store.ts");
 const { seal } = await import("../src/crypto.ts");
 
 // Importing main.ts also imports cron.ts, which registers the jobs while the
@@ -432,17 +431,6 @@ Deno.exit(failed ? 1 : 0);
  * point of the test is that the error is *caught*, so the stack trace would
  * only look like a failure.
  */
-async function quietly<T>(fn: () => Promise<T>): Promise<T> {
-  const { log: realLog, error: realError } = console;
-  console.log = () => {};
-  console.error = () => {};
-  try {
-    return await fn();
-  } finally {
-    console.log = realLog;
-    console.error = realError;
-  }
-}
 
 /** Assert the HTTP status a handler answers with. */
 async function expect(name: string, response: Response | Promise<Response>, want: number) {
