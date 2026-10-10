@@ -243,21 +243,48 @@ cron trigger — and `src/records.ts` hides which database is behind the store:
 | state    | `data/store.kv` (`store.json` before that) | one row in D1, key `caffi store`                            |
 | schedule | timers in `src/scheduler.ts`               | `scheduled` → self-`fetch /race` → the same runner          |
 
-### Why the cron handler fetches itself
+### The schedule
 
-**Smart Placement** holds a Worker in the Cloudflare colo closest to the origin it calls, and the
-Caffi API is a single VNPT address in Vietnam (`222.255.215.152`) that Cloudflare can triangulate.
-That matters more than it sounds: Deno Deploy ran in `ord`/`ams`, which measured **265ms** to the
-Caffi servers — larger than the whole midnight race — and the placement the Worker gets instead
-measured **52ms**. But placement only applies to **fetch** handlers, so the cron handler never calls
-the API itself: it wakes `/race` over HTTP and the check-in runs inside a placed fetch.
+The check-in is triggered over HTTP, not by the platform's cron.
 
+|              |                                                            |
+| ------------ | ---------------------------------------------------------- |
+| **The race** | `cron-job.com` → `GET /race?job=pre-roll`                  |
+| **The net**  | the platform's own catch-up cron, `28 17 * * *` (00:28 VN) |
+
+Two jobs in cron-job.com (timezone `Asia/Ho_Chi_Minh`):
+
+| Job   | URL                                                                        | Schedule                                                                |
+| ----- | -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Race  | `https://caffi.tachibshin.indevs.in/race?job=pre-roll&key=<WORKER_SECRET>` | `55 23 * * *` (23:59:55 VN)                                             |
+| Check | `https://caffi.tachibshin.indevs.in/race?job=catch-up&key=<WORKER_SECRET>` | `28 0 * * *` (00:28 VN) — optional, the platform cron is the same thing |
+
+**Why HTTP, when the platform has cron triggers.** Smart Placement is what puts the isolate in the
+Cloudflare colo closest to the Caffi servers (a single VNPT address in Vietnam, ~52ms instead of the
+~265ms Deno Deploy's `ord`/`ams` saw) — and it only applies to **fetch handlers**. The platform's
+cron runs wherever Cloudflare had a spare machine, unplaced. Worse, on 2026-10-11 the cron handler
+tried to wake `/race` on itself and could not: a Worker cannot subrequest itself (`workers.dev`
+answers 404, a custom domain 522), so the pre-roll reported Success at 23:56:26 while the day's
+check-in landed at 00:14:55 — by hand.
+
+So the schedule is an HTTP call, and the secret rides in the URL (cron-job.com sends no custom
+headers; a bearer token, basic auth and `?key=` all work).
+
+**Why 23:59:55, not 23:56.** cron-job.com's free tier cuts a job off after 30 seconds, and a
+pre-roll that starts five minutes early would be killed mid-wait. The watcher polls from whenever it
+arrives up to the flip, so a few seconds of jitter either way costs nothing — and being late still
+checks in, just lower in the day's ranking.
+
+The platform keeps its **catch-up** trigger as the net: it fires at 00:28 and runs `tick(true)`, so
+a run the external job started but never finished (an isolate recycled, a 30s cut) still completes.
+If both run, the second sees the day already done and no-ops.
+
+To see what the last run did, read the store: `cron:lastRun` holds the job, the measured RTT to
+Caffi, the day it finished and how long it took — no platform logs needed.
+
+```bash
+bunx wrangler d1 execute caffi --remote --command "SELECT value FROM records WHERE key LIKE 'caffi/meta/cron%';"
 ```
-[triggers] crons = ["56 16 * * *", "28 17 * * *"]   # 23:56 and 00:28 Vietnam
-```
-
-Those two specs must stay identical to `preRollCronSpec()` / `catchUpCronSpec()` in
-`src/scheduler.ts`; `deno task deploycheck` fails the build when they drift.
 
 ### First deploy
 

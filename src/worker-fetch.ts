@@ -52,28 +52,45 @@ async function telegram(req: Request): Promise<Response> {
  * could force a run — the store's per-day markers would stop a real double
  * check-in, but there is no reason to accept the traffic.
  */
+/**
+ * The midnight check-in, as an HTTP call.
+ *
+ * Smart Placement only applies to fetch handlers, so an HTTP caller is what gets
+ * the isolate held next to the Caffi servers — and that is the whole race. It is
+ * also why the schedule is driven from cron-job.com instead of the platform's
+ * cron triggers: those fire unplaced, and this is the one job that must not.
+ *
+ * cron-job.com sends no custom headers, so the secret is accepted as a bearer
+ * token, as basic auth, or as `?key=` — whichever the job is configured with.
+ */
 async function race(req: Request): Promise<Response> {
+  const url = new URL(req.url);
   const auth = req.headers.get("authorization") ?? "";
-  if (auth !== `Bearer ${config.workerSecret}`) {
+  const basic = auth.startsWith("Basic ") ? atob(auth.slice(6)).split(":").slice(1).join(":") : "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const key = url.searchParams.get("key") ?? "";
+  const offered = [bearer, basic, key].filter((v) => v.length > 0);
+  if (!config.workerSecret || !offered.includes(config.workerSecret)) {
     return new Response(null, { status: 401 });
   }
 
-  const url = new URL(req.url);
   const job = url.searchParams.get("job") ?? "pre-roll";
+  const catchUp = job === "catch-up";
   const { createRunner, preRollCronSpec, catchUpCronSpec } = await import("./scheduler.ts");
 
-  const spec = job === "catch-up" ? catchUpCronSpec() : preRollCronSpec();
+  const spec = catchUp ? catchUpCronSpec() : preRollCronSpec();
   const startedAt = Date.now();
   const { fanOut } = await booted();
   const runner = createRunner(fanOut);
   // `force` is what lets the catch-up job finish a run the pre-roll started but
   // never completed (an isolate recycled mid-flight).
-  await runner.tick(job === "catch-up");
+  await runner.tick(catchUp);
   await store.flush();
 
   const ms = Date.now() - startedAt;
-  console.log(`🏁 race (${spec}) finished in ${ms}ms`);
-  return new Response(`ok ${ms}ms`, { status: 200 });
+  const placement = req.headers.get("cf-placement") ?? "no placement header";
+  console.log(`🏁 race (${spec}) ${ms}ms · ${placement} · day ${store.data.lastAutoRunDoneDate}`);
+  return new Response(`ok ${ms}ms · ${placement}`, { status: 200 });
 }
 
 /**

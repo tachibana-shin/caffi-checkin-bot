@@ -18,11 +18,15 @@ binding = "caffi"
 database_name = "caffi"
 database_id = "81920473-d963-4062-9c41-3319364d3de4"
 
-# Both jobs are UTC (Vietnam is UTC+7, no DST). They must stay identical to
-# `preRollCronSpec()` / `catchUpCronSpec()` in src/scheduler.ts — `deno task
-# deploycheck` and scripts/check-cron.ts fail the build when they drift.
+# One trigger only: the catch-up, as a net. The race itself is driven from
+# cron-job.com, which calls `/race` over HTTP — that is the only invocation Smart
+# Placement applies to, and the difference is the midnight ranking. A platform
+# cron at 16:56 would start the run first and block the external caller, so the
+# pre-roll is gone; this one fires 29 minutes later and only runs when the race
+# has not finished (`tick(true)`), which is exactly the "the external job died
+# mid-flight" case.
 [triggers]
-crons = ["56 16 * * *", "28 17 * * *"]
+crons = ["28 17 * * *"]
 
 # Non-secret configuration. Anything sensitive (BOT_SECRET, the Telegram and
 # Discord tokens) goes in `wrangler secret put`.
