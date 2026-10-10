@@ -149,6 +149,19 @@ export async function runCheckIn(
 type DayOpenMode = "race" | "catch_up";
 
 /**
+ * How many status reads to keep in flight while the window is near.
+ *
+ * One round trip to Caffi is ~265ms, so a reader that waits for its own
+ * response can only sample the server every ~300ms: the day may flip and stay
+ * invisible until the next read comes back — up to two round trips late, which
+ * is what put 09-10 at +1730ms. Keeping a few readers going turns every
+ * response into a fresh sample, so the flip surfaces within one round trip of
+ * happening. Six simultaneous connections is the Cloudflare ceiling, so three
+ * leaves room for the POSTs that follow.
+ */
+const WATCH_PIPELINE = 3;
+
+/**
  * One session watches the server until it counts `runDate` as today.
  *
  * Nothing else can answer "is it midnight on the server yet": the flip is only
@@ -171,24 +184,42 @@ async function waitForDayOpen(
   const targetMs = vnMidnightMs(runDate);
   const startedAt = Date.now();
   let reads = 0;
+  /** What the first reader to learn the truth found. */
+  let verdict: DayOpenMode | "dead" | undefined;
 
-  for (;;) {
-    reads++;
-    try {
-      const s = await api.getCheckInStatus();
-      // "check_in" (fresh day, not yet taken) and "already_done" (this account
-      // is in) both mean the day is open; only the previous day blocks.
-      if (decideFromStatus(s, runDate) !== "pending_day") return reads === 1 ? "catch_up" : "race";
+  const reader = async (slot: number): Promise<void> => {
+    // Stagger the first read so the readers do not all sample the same instant.
+    if (slot > 0) await sleep(slot * 50);
+    while (verdict === undefined) {
+      reads++;
+      try {
+        const s = await api.getCheckInStatus();
+        // "check_in" (fresh day, not yet taken) and "already_done" (this account
+        // is in) both mean the day is open; only the previous day blocks.
+        if (decideFromStatus(s, runDate) !== "pending_day") {
+          // The first batch is the very first look we took — the day was
+          // already open. Anything after it means the flip happened while we
+          // were watching, which is the race.
+          verdict = reads <= WATCH_PIPELINE ? "catch_up" : "race";
+          return;
+        }
+      } catch (e) {
+        if (e instanceof SessionExpiredError) {
+          verdict = "dead";
+          return;
+        }
+        // A dropped read is not a verdict: keep watching.
+      }
+      if (Date.now() >= deadline) return;
       await sleep(pollDelay(targetMs, Date.now(), startedAt));
-    } catch (e) {
-      if (e instanceof SessionExpiredError) throw e;
-      // A dropped read is not a verdict: come back quickly instead of backing
-      // off to 10s, which a pre-roll cannot afford.
-      if (Date.now() >= deadline) return null;
-      await sleep(200);
     }
-    if (Date.now() >= deadline) return null;
-  }
+  };
+
+  await Promise.all(Array.from({ length: WATCH_PIPELINE }, (_, slot) => reader(slot)));
+
+  if (verdict === "dead") throw new SessionExpiredError("Phiên đã hết hạn");
+  if (verdict === undefined) return null; // the window closed on an open question
+  return verdict;
 }
 
 /**

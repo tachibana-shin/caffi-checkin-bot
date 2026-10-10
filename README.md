@@ -125,12 +125,17 @@ What happens at run time (`runCheckIn` for one account, `runCheckInAll` for the 
 
 **Several accounts, one race.** One account's session watches for the flip (`waitForDayOpen`); the
 moment it lands, **every** `POST` is issued from the same `Promise.all`, with the per-account status
-read skipped on purpose. That read is one round trip (~250ms from the `ord`/`ams` regions to the
+read skipped on purpose. That read is one round trip (~265ms from the `ord`/`ams` regions to the
 Caffi servers in Vietnam), and one read per account is exactly what used to cost the ranking:
 measured on 2026-10-09, the account that had been watching since the pre-roll got **rank 3 at
 00:00:00** while the one that woke up at midnight and had to discover the flip by itself got **rank
 10 at 00:00:01** — a round trip of distance between two check-ins that should have been
 simultaneous. One poller also keeps the request rate at one session instead of N.
+
+The watch itself is pipelined: three reads stay in flight, so a reader that waits for its own
+response cannot miss the flip for two round trips. The pre-roll also makes one read per account
+**before** it naps — a cold isolate's first request to Caffi costs ~1.1s against ~265ms warm, and on
+09-10 that cold start was most of the +1730ms the server recorded.
 
 A run that starts when the day is already open — a restart, the catch-up cron, a re-run — cannot
 race anyone, so `runCheckInAll` asks each account on its own session instead and honours "already

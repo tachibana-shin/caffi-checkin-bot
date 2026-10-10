@@ -1,6 +1,6 @@
 import { boot } from "./boot.ts";
 import { config } from "./config.ts";
-import { sleep } from "./checkin.ts";
+import { apiFor, sleep } from "./checkin.ts";
 import { catchUpCronSpec, createRunner, msUntilWindow, preRollCronSpec } from "./scheduler.ts";
 import { store } from "./store.ts";
 
@@ -20,6 +20,12 @@ function registerCron(): void {
     preRollCronSpec(),
     { backoffSchedule: [1000, 5000] },
     async () => {
+      // Pay for the cold isolate now, while the second is still worth nothing:
+      // the first request a fresh isolate makes to Caffi costs ~1.1s (booting
+      // modules, DNS, TLS) against ~265ms once the connection is warm, and that
+      // difference is larger than the whole race. 09-10-2026 measured +1730ms
+      // at the server, of which ~1.1s was this.
+      await warmConnections();
       const nap = msUntilWindow(new Date());
       if (nap > 0) {
         // Cron only has minute resolution; the race needs the exact second.
@@ -40,6 +46,26 @@ function registerCron(): void {
   );
 
   console.log(`⏰ Cron: ${preRollCronSpec()} (pre-roll) · ${catchUpCronSpec()} (catch-up) UTC`);
+}
+
+/**
+ * One read per account, three minutes before the window, so the isolate, the
+ * module graph and the TLS connection to Caffi are all hot by 23:59:55. Also
+ * flushes out a dropped session while there is still time to report it.
+ */
+async function warmConnections(): Promise<void> {
+  try {
+    await store.load();
+    const startedAt = Date.now();
+    await Promise.all(
+      store.autoAccounts().map(async ({ account }) => {
+        await apiFor(account).getCheckInStatus().catch(() => {});
+      }),
+    );
+    console.log(`🔥 Pre-roll warmed in ${Date.now() - startedAt}ms`);
+  } catch (e) {
+    console.error("[warm] failed:", e);
+  }
 }
 
 async function run(force: boolean): Promise<void> {

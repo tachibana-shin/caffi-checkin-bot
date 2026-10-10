@@ -39,14 +39,17 @@ const S: Stub = {
 const posts: Array<{ user: string; at: number }> = [];
 const statusReads: Array<{ user: string; at: number }> = [];
 const refreshes: Array<{ token: string; at: number }> = [];
+/** Peak number of status reads in flight — proves the watcher pipelines. */
+let maxInFlight = 0;
+let inFlight = 0;
 
 /** A JWT-shaped access token with the given `exp` (seconds). */
 const jwt = (exp: number) =>
   `h.${btoa(JSON.stringify({ exp })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}.s`;
 
-// The stub answers synchronously; `fetch` is awaited by the client either way,
-// so a cast is all the typing this needs.
-const stub = (input: unknown, init?: RequestInit): Response => {
+// The stub is async because a read has to take the round trip it takes on the
+// wire; `fetch`'s real signature is what the bot awaits either way.
+const stub = async (input: unknown, init?: RequestInit): Promise<Response> => {
   const url = String(input instanceof Request ? input.url : input);
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const auth = (init?.headers as Record<string, string>)?.Authorization ??
@@ -70,6 +73,11 @@ const stub = (input: unknown, init?: RequestInit): Response => {
 
   if (path === "/api/v2/xeng/check-in/status") {
     if (S.dead.has(user)) return json(401, { error: { code: "UNAUTHORIZED" } });
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    // A read takes the round trip it would take on the wire.
+    await new Promise((r) => setTimeout(r, 265));
+    inFlight--;
     statusReads.push({ user, at: now });
     // What the app sees. Before the server opens the day, "today" is still
     // yesterday and we already checked in for it — that is `pending_day`.
@@ -103,7 +111,6 @@ const stub = (input: unknown, init?: RequestInit): Response => {
 };
 
 globalThis.fetch = stub as unknown as typeof fetch;
-
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -141,6 +148,8 @@ function reset() {
   posts.length = 0;
   statusReads.length = 0;
   refreshes.length = 0;
+  maxInFlight = 0;
+  inFlight = 0;
   S.dead.clear();
   S.alreadyIn.clear();
 }
@@ -170,6 +179,11 @@ const raceMs = Date.now() - t0;
 const sent = posts.map((p) => p.at);
 const spread = Math.max(...sent) - Math.min(...sent);
 check("both accounts POSTed", posts.length === 2, `${posts.length} POST(s)`);
+check(
+  "the watcher keeps several reads in flight, not one at a time",
+  maxInFlight >= 2,
+  `peak ${maxInFlight} in flight`,
+);
 check(
   "POSTs leave together (< one round trip)",
   spread < 50,
