@@ -107,7 +107,8 @@ const realLog = console.log;
 console.log = (...args: unknown[]) => {
   cronLines.push(args.map((a) => String(a)).join(" "));
 };
-const { registerHandlers } = await import("../src/main.ts");
+const { registerHandlers } = await import("../src/handlers.ts");
+await import("../src/cron.ts");
 console.log = realLog;
 
 const { senderFor, webhookHandler } = await import("../src/telegram.ts");
@@ -217,7 +218,7 @@ check(
 
 const cronLog = cronLines.find((l) => l.includes("Cron:")) ?? "";
 check(
-  "main.ts registers both Deno.cron jobs",
+  "cron.ts registers both Deno.cron jobs",
   typeof Deno.cron === "function" && /pre-roll/.test(cronLog) && /catch-up/.test(cronLog),
   cronLog.replace("⏰ ", ""),
 );

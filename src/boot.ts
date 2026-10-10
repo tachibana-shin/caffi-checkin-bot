@@ -1,6 +1,7 @@
 import type { Bot } from "grammy";
 import { config } from "./config.ts";
 import { store } from "./store.ts";
+import { registerHandlers } from "./handlers.ts";
 import { createBot, type Sender, senderFor } from "./telegram.ts";
 
 export interface Booted {
@@ -30,10 +31,13 @@ async function create(): Promise<Booted> {
   await store.load();
 
   const bot = createBot(config.botToken);
-  // grammY refuses to touch an update without `botInfo`, and `main.ts`'s
-  // `bot.init()` only exists in the Deno shapes. One `getMe` per isolate.
+  // grammY refuses to touch an update without `botInfo`, and `main.ts` is not
+  // where the Worker boots. One `getMe` per isolate.
   await bot.init();
   const tg = senderFor(bot);
+  // The command handlers live in handlers.ts. Both shapes register them here, or
+  // grammY accepts updates and answers 200 with nothing attached.
+  registerHandlers(bot, tg);
 
   const fanOut: Sender = {
     async send(chatId, card, opts) {

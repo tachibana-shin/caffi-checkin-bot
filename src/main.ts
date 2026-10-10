@@ -1,35 +1,33 @@
 import type { Bot } from "grammy";
 import { boot, type Booted } from "./boot.ts";
-import { type Ctx, handleNav, handleText } from "./commands.ts";
 import { config } from "./config.ts";
 import { startScheduler } from "./scheduler.ts";
 import { store } from "./store.ts";
-import { ensureWebhook, type Sender, webhookHandler } from "./telegram.ts";
+import { ensureWebhook, webhookHandler } from "./telegram.ts";
 // Imported for its side effect: `Deno.cron` must be registered while the module
 // is still being evaluated (Deno Deploy discovers the schedule at build time).
 import "./cron.ts";
 
 /**
- * Both shapes share the store, the scheduler and the command handlers —
- * only delivery differs. `polling` is the local shape (grammY long polling +
- * Discord gateway + an interval scheduler); `webhook` is the Deno Deploy shape
- * (HTTP endpoint + `Deno.cron`), because Deno Deploy runs several isolated
- * instances at once and two polling loops or two gateways would fight.
+ * Every shape shares the store, the scheduler and the command handlers — only
+ * delivery differs. `polling` is the local shape (grammY long polling plus an
+ * interval scheduler); `webhook` and `worker` are the two serverless shapes
+ * (an HTTP endpoint plus a cron), because both hosts run several isolated
+ * instances at once and two polling loops would fight.
  */
 async function main() {
   console.log("🚀 Caffi Auto Check-in Bot");
 
   const booted = await boot();
   console.log(
-    `💾 Store: Deno KV${config.deploy ? " (platform)" : ` at ${config.dataDir}/store.kv`}` +
+    `💾 Store: ${
+      config.runtimeMode === "worker" ? "D1 (Cloudflare)" : `${config.dataDir}/store.kv`
+    }` +
       (store.encrypted ? " · AES-256-GCM" : " · PLAINTEXT (set BOT_SECRET!)"),
   );
 
-  const { bot, tg, fanOut } = booted;
-  await bot.init();
+  const { bot, fanOut } = booted;
   console.log(`🤖 Logged in to Telegram as @${bot.botInfo.username}`);
-
-  registerHandlers(bot, tg);
 
   if (config.runtimeMode === "webhook") {
     await startWebhook(booted);
@@ -38,78 +36,6 @@ async function main() {
     startScheduler(fanOut);
     startPolling(bot);
   }
-}
-
-/**
- * Handlers are identical in both modes — grammY routes updates either way.
- * Exported for `scripts/deploycheck.ts`, which feeds the webhook callback
- * through the very same wiring the deployed app uses.
- */
-export function registerHandlers(bot: Bot, tg: Sender) {
-  // Private chats only: the login/OTP flow is strictly 1:1.
-  bot.on("message:text", async (ctx) => {
-    const msg = ctx.message;
-    if (msg.chat.type !== "private") return;
-
-    const cmdCtx: Ctx = {
-      tg,
-      chatId: `tg:${msg.chat.id}`,
-      userId: msg.from?.id ?? msg.chat.id,
-      raw: msg.text,
-    };
-
-    try {
-      await handleText(cmdCtx);
-    } catch (e) {
-      console.error(`[cmd] failed on "${msg.text.slice(0, 40)}":`, e);
-      await tg.send(`tg:${msg.chat.id}`, {
-        icon: "❌",
-        title: "Có lỗi xảy ra",
-        subtitle: "Thử lại sau ít phút.",
-        tone: "error",
-      }).catch(() => {});
-    }
-
-    await store.flush();
-  });
-
-  // Menu buttons redraw the message they came from instead of posting a new one.
-  bot.on("callback_query:data", async (ctx) => {
-    const query = ctx.callbackQuery;
-    const data = query.data;
-    if (!data.startsWith("nav:")) {
-      await ctx.answerCallbackQuery().catch(() => {});
-      return;
-    }
-
-    const chat = query.message?.chat;
-    if (!chat || chat.type !== "private") {
-      await ctx.answerCallbackQuery().catch(() => {});
-      return;
-    }
-
-    // Answer first: the button must stop spinning even if the command fails.
-    await ctx.answerCallbackQuery().catch(() => {});
-
-    const cmdCtx: Ctx = {
-      tg,
-      chatId: `tg:${chat.id}`,
-      userId: ctx.from?.id ?? chat.id,
-      raw: "",
-      editMessageId: query.message?.message_id,
-    };
-
-    try {
-      await handleNav(cmdCtx, data);
-    } catch (e) {
-      console.error(`[nav] failed on "${data}":`, e);
-    }
-
-    await store.flush();
-  });
-
-  // Middleware errors must not take the transport down with them.
-  bot.catch((err) => console.error(`[grammy] update ${err.ctx.update.update_id}:`, err.error));
 }
 
 /**

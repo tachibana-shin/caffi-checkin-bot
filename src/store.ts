@@ -1,6 +1,6 @@
 import { seal, unseal } from "./crypto.ts";
 import { config } from "./config.ts";
-import { d1Store, kvStore, type RecordStore } from "./records.ts";
+import { d1StoreAutoMigrate, kvStore, type RecordStore } from "./records.ts";
 import type { Account, ChatState, StoreData } from "./types.ts";
 
 /**
@@ -27,7 +27,7 @@ function emptyStore(): StoreData {
 function workerDb(): RecordStore | undefined {
   // Set by `src/worker.ts` before anything imports the config.
   const g = globalThis as { __caffiDb?: import("./records.ts").D1Like };
-  return g.__caffiDb ? d1Store(g.__caffiDb) : undefined;
+  return g.__caffiDb ? d1StoreAutoMigrate(g.__caffiDb) : undefined;
 }
 
 async function openRecords(): Promise<RecordStore> {

@@ -77,6 +77,47 @@ export async function d1Init(db: D1Like): Promise<void> {
   await (db.prepare(D1_SCHEMA) as unknown as { run(): Promise<unknown> }).run();
 }
 
+/**
+ * A D1 store that creates its own table the first time it is asked for one.
+ *
+ * A fresh D1 database — `wrangler dev`, or a new environment — has no table
+ * yet, and D1 answers that with SQLITE_ERROR. Rather than a migration step that
+ * has to be remembered, the store creates it on the way past: in production the
+ * table exists, so the first `SELECT` succeeds and this never runs.
+ */
+export function d1StoreAutoMigrate(db: D1Like): RecordStore {
+  const store = d1Store(db);
+  return {
+    async get<T>(key: string[]) {
+      try {
+        return await store.get<T>(key);
+      } catch (e) {
+        if (!String(e).includes("no such table")) throw e;
+        await d1Init(db);
+        return await store.get<T>(key);
+      }
+    },
+    async set(key, value) {
+      try {
+        await store.set(key, value);
+      } catch (e) {
+        if (!String(e).includes("no such table")) throw e;
+        await d1Init(db);
+        await store.set(key, value);
+      }
+    },
+    async list(prefix) {
+      try {
+        return await store.list(prefix);
+      } catch (e) {
+        if (!String(e).includes("no such table")) throw e;
+        await d1Init(db);
+        return await store.list(prefix);
+      }
+    },
+  };
+}
+
 // ── Deno KV ─────────────────────────────────────────────────────────────────
 
 /** Wraps a `Deno.Kv` behind the same two-method surface. */
