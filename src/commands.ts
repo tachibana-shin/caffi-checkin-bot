@@ -271,7 +271,7 @@ export function helpCard(): Card {
       },
       {
         heading: "⏰ Hành động",
-        text: "/checkin — điểm danh ngay (không cần chờ 00:00)",
+        text: "/checkin — điểm danh mọi tài khoản ngay (không cần chờ 00:00)",
       },
     ],
     footer: "🔒 Phiên bị server đá → bot nhắn báo bạn đăng nhập lại.",
@@ -1637,6 +1637,15 @@ export function shopsCard(providers: Provider[]): Card {
 }
 
 async function doManualCheckIn(ctx: Ctx) {
+  const chat = store.chat(ctx.chatId);
+  const { name } = targetArgs(ctx);
+
+  // No login named and the chat holds more than one: check in **all** of them.
+  // Naming one (`/checkin ten@x.com`) still targets just that login.
+  if (!name && Object.keys(chat.accounts).length > 1) {
+    return checkInAll(ctx, chat);
+  }
+
   const account = await requireAccount(ctx);
   if (!account) return;
   await reply(ctx, { icon: "⏳", title: "Đang điểm danh…", tone: "info", progress: true });
@@ -1644,7 +1653,109 @@ async function doManualCheckIn(ctx: Ctx) {
   if (r.outcome === "session_expired") {
     return notifyRelogin(ctx, account, r.card);
   }
-  return reply(ctx, r.card, SCREEN);
+  // Keep the login visible: one chat may hold several Caffi accounts, and the
+  // card itself never names one (the nightly run does the same).
+  const many = Object.keys(chat.accounts).length > 1;
+  return reply(ctx, {
+    ...r.card,
+    subtitle: many ? account.username : r.card.subtitle,
+  }, SCREEN);
+}
+
+/** A stat value by the start of its label — the two cards spell "Chuỗi" differently. */
+function statOf(card: Card, prefix: string): string {
+  return card.stats?.find((s) => s.label.startsWith(prefix))?.value ?? "—";
+}
+
+/**
+ * `/checkin` with no account name: one run per login in the chat, all at once.
+ *
+ * The midnight run already does this, and a chat holding several logins should
+ * not have to type the same command once per account. Sessions the server
+ * dropped are skipped rather than attempted — asking would only fail.
+ */
+async function checkInAll(ctx: Ctx, chat: ChatState): Promise<void> {
+  const all = Object.values(chat.accounts);
+  const list = all.filter((a) => !a.sessionInvalid);
+  if (!list.length) {
+    return reply(ctx, {
+      icon: "🔒",
+      title: "Không có tài khoản nào điểm danh được",
+      subtitle: `${all.length} phiên đã bị đăng xuất.`,
+      tone: "error",
+      blocks: [{ text: "Gõ /login để đăng nhập lại từng tài khoản." }],
+    });
+  }
+
+  await reply(ctx, {
+    icon: "⏳",
+    title: `Đang điểm danh ${num(list.length)} tài khoản…`,
+    tone: "info",
+    progress: true,
+  });
+
+  const results = await Promise.all(
+    list.map(async (a) => ({ account: a, result: await runCheckIn(a) })),
+  );
+
+  const ICON: Record<string, string> = {
+    checked_in: "✅",
+    already_done: "✅",
+    pending_day: "⏳",
+    session_expired: "🔒",
+    failed: "⚠️",
+  };
+
+  const table = grid([
+    ["", "Tài khoản", "Chuỗi", "Hạng", "Giờ"],
+    ...results.map(({ account, result }) => [
+      ICON[result.outcome] ?? "•",
+      trunc(account.username, 26),
+      statOf(result.card, "Chuỗi"),
+      statOf(result.card, "Hạng"),
+      statOf(result.card, "Điểm danh lúc"),
+    ]),
+  ]);
+
+  const done =
+    results.filter(({ result }) =>
+      result.outcome === "checked_in" || result.outcome === "already_done"
+    ).length;
+  const broken = results.filter(({ result }) =>
+    result.outcome === "failed" || result.outcome === "session_expired" ||
+    result.outcome === "pending_day"
+  );
+  const skipped = all.length - list.length;
+
+  const blocks: NonNullable<Card["blocks"]> = [{ mono: true, text: table }];
+  if (broken.length) {
+    blocks.push({
+      heading: "Chưa xong",
+      text: broken.map(({ account, result }) =>
+        `${trunc(account.username, 30)} — ${
+          trunc(
+            statOf(result.card, "Điểm danh lúc") && result.outcome === "pending_day"
+              ? "Server chưa mở ngày mới"
+              : result.card.subtitle ?? result.outcome,
+            60,
+          )
+        }`
+      ).join("\n"),
+    });
+  }
+
+  return reply(ctx, {
+    icon: done === list.length ? "🎉" : "⚠️",
+    title: `Điểm danh ${num(done)}/${num(list.length)} tài khoản`,
+    tone: done === list.length ? "success" : "warn",
+    stats: [
+      { label: "Đã điểm danh", value: num(done) },
+      { label: "Còn lại", value: num(list.length - done) },
+      ...(skipped ? [{ label: "Hết phiên", value: num(skipped) }] : []),
+    ],
+    blocks,
+    footer: "Gõ /checkin <tên> để chỉ chạy một tài khoản.",
+  }, SCREEN);
 }
 
 async function notifyRelogin(ctx: Ctx, account: Account, card: Card) {

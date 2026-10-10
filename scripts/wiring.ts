@@ -171,6 +171,50 @@ const redrawn = sent.map((s) => s.text).join("\n");
 const bLine = redrawn.split("\n").find((l) => l.includes("b@test")) ?? "";
 check("…and redraws the list with ▶ on the new one", bLine.includes("▶"), bLine.slice(0, 40));
 
+// `/checkin` with no name checks in every login in the chat. The network is
+// stubbed (`fetch` throws), so each account ends up "failed" — which is the
+// shape the card has to survive, and the one thing it must not do is answer
+// about a single account only.
+const offline = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const real = globalThis.fetch;
+  globalThis.fetch = (() => {
+    throw new Error("offline");
+  }) as never;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = real;
+  }
+};
+
+// Two live logins first: both must be attempted.
+chat.accounts["c@test"] = account("c@test");
+store.touch();
+sent.length = 0;
+await offline(() => handleText({ tg, chatId: 999, userId: 999, raw: "/checkin" }));
+const checkInAll = sent.map((x) => x.text).join("\n");
+check(
+  "/checkin with no name runs for every login",
+  checkInAll.includes("a@test") && checkInAll.includes("c@test"),
+  checkInAll.split("\n")[0],
+);
+check(
+  "…one run per live login",
+  /\d\/2/.test(checkInAll),
+  checkInAll.split("\n").find((l) => l.includes("/2")) ?? "no /2 line",
+);
+check("…expired logins are skipped, not attempted", checkInAll.includes("Hết phiên"));
+
+// Naming one login still targets just that one.
+sent.length = 0;
+await offline(() => handleText({ tg, chatId: 999, userId: 999, raw: "/checkin a@test" }));
+const named = sent.map((x) => x.text).join("\n");
+check(
+  "/checkin <tên> targets that login only",
+  named.includes("a@test") && !named.includes("c@test"),
+  named.split("\n")[0],
+);
+
 // A chat whose logins are all expired can render the roll-up offline.
 const dead = store.chat(888);
 dead.accounts = {
