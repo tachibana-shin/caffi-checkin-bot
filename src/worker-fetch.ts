@@ -75,11 +75,39 @@ async function race(req: Request): Promise<Response> {
   }
 
   const job = url.searchParams.get("job") ?? "pre-roll";
+  const startedAt = Date.now();
+
+  // `warm` is the half of the schedule that runs a minute early: it boots the
+  // isolate and opens one connection to Caffi, so the call at 00:00 does not pay
+  // the ~1.1s a cold isolate spends on DNS, TLS and module graph. It checks
+  // nothing in.
+  if (job === "warm") {
+    await booted(); // loads the store; without it there is no account to warm with
+    const target = store.autoAccounts()[0];
+    let rtt: number | null = null;
+    if (target) {
+      const t = Date.now();
+      try {
+        const { apiFor } = await import("./checkin.ts");
+        await apiFor(target.account).getCheckInStatus();
+        rtt = Date.now() - t;
+      } catch (e) {
+        console.error("[race] warm-up read failed:", e);
+      }
+    }
+    await store.setMeta("cron:warm", {
+      at: new Date().toISOString(),
+      rtt,
+      ms: Date.now() - startedAt,
+    });
+    console.log(`🔥 warm ${Date.now() - startedAt}ms · rtt ${rtt}ms`);
+    return new Response(`warm ${Date.now() - startedAt}ms · rtt ${rtt}ms`, { status: 200 });
+  }
+
   const catchUp = job === "catch-up";
   const { createRunner, preRollCronSpec, catchUpCronSpec } = await import("./scheduler.ts");
 
   const spec = catchUp ? catchUpCronSpec() : preRollCronSpec();
-  const startedAt = Date.now();
   const { fanOut } = await booted();
   const runner = createRunner(fanOut);
   // `force` is what lets the catch-up job finish a run the pre-roll started but

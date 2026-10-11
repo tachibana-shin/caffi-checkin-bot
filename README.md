@@ -247,43 +247,48 @@ cron trigger — and `src/records.ts` hides which database is behind the store:
 
 The check-in is triggered over HTTP, not by the platform's cron.
 
-|              |                                                            |
-| ------------ | ---------------------------------------------------------- |
-| **The race** | `cron-job.com` → `GET /race?job=pre-roll`                  |
-| **The net**  | the platform's own catch-up cron, `28 17 * * *` (00:28 VN) |
+|          |                                                            |
+| -------- | ---------------------------------------------------------- |
+| **Warm** | `cron-job.com` 23:59 VN → `GET /race?job=warm`             |
+| **Race** | `cron-job.com` 00:00 VN → `GET /race?job=pre-roll`         |
+| **Net**  | the platform's own catch-up cron, `28 17 * * *` (00:28 VN) |
 
-Two jobs in cron-job.com (timezone `Asia/Ho_Chi_Minh`):
+Two jobs in cron-job.com (its job timezone is UTC; Vietnam is UTC+7):
 
-| Job   | URL                                                                        | Schedule                                                                |
-| ----- | -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| Race  | `https://caffi.tachibshin.indevs.in/race?job=pre-roll&key=<WORKER_SECRET>` | `55 23 * * *` (23:59:55 VN)                                             |
-| Check | `https://caffi.tachibshin.indevs.in/race?job=catch-up&key=<WORKER_SECRET>` | `28 0 * * *` (00:28 VN) — optional, the platform cron is the same thing |
+| Job          | URL                                                    | Schedule (UTC)         |
+| ------------ | ------------------------------------------------------ | ---------------------- |
+| `caffi warm` | `https://<host>/race?job=warm&key=<WORKER_SECRET>`     | every day at **16:59** |
+| `caffi race` | `https://<host>/race?job=pre-roll&key=<WORKER_SECRET>` | every day at **17:00** |
 
-**Why HTTP, when the platform has cron triggers.** Smart Placement is what puts the isolate in the
-Cloudflare colo closest to the Caffi servers (a single VNPT address in Vietnam, ~52ms instead of the
-~265ms Deno Deploy's `ord`/`ams` saw) — and it only applies to **fetch handlers**. The platform's
-cron runs wherever Cloudflare had a spare machine, unplaced. Worse, on 2026-10-11 the cron handler
-tried to wake `/race` on itself and could not: a Worker cannot subrequest itself (`workers.dev`
-answers 404, a custom domain 522), so the pre-roll reported Success at 23:56:26 while the day's
-check-in landed at 00:14:55 — by hand.
+**Why HTTP, when the platform has cron triggers.** Smart Placement is what holds the isolate in the
+Cloudflare colo closest to the Caffi servers (a single VNPT address in Vietnam) — and it only
+applies to **fetch handlers**. The platform's cron fires wherever Cloudflare had a spare machine,
+unplaced.
 
-So the schedule is an HTTP call, and the secret rides in the URL (cron-job.com sends no custom
-headers; a bearer token, basic auth and `?key=` all work).
+Worse, the cron handler used to wake `/race` on itself and could not: a Worker cannot subrequest
+itself (`workers.dev` answers 404, a custom domain 522). On 2026-10-11 the pre-roll fired at
+23:56:26 and reported Success (41.8ms CPU) while the day's check-in landed at 00:14:55 — by hand.
 
-**Why 23:59:55, not 23:56.** cron-job.com's free tier cuts a job off after 30 seconds, and a
-pre-roll that starts five minutes early would be killed mid-wait. The watcher polls from whenever it
-arrives up to the flip, so a few seconds of jitter either way costs nothing — and being late still
-checks in, just lower in the day's ranking.
+**Why two jobs instead of one.** cron-job.com's free tier cuts a job off after 30 seconds, and its
+crontab has no seconds field — so "23:59:55" is not expressible. A job at 23:59:00 would be killed
+mid-wait. So the minute before midnight only **warms**: it boots the isolate and opens one
+connection to Caffi, because the first request from a cold isolate costs ~1.1s against ~95ms warm.
+The call at 00:00 then polls for the flip and POSTs — a couple of seconds of work.
 
-The platform keeps its **catch-up** trigger as the net: it fires at 00:28 and runs `tick(true)`, so
-a run the external job started but never finished (an isolate recycled, a 30s cut) still completes.
-If both run, the second sees the day already done and no-ops.
+`?key=` carries the secret because cron-job.com sends no custom headers; a bearer token and basic
+auth are accepted too.
 
-To see what the last run did, read the store: `cron:lastRun` holds the job, the measured RTT to
-Caffi, the day it finished and how long it took — no platform logs needed.
+**The net.** The platform keeps its catch-up trigger at 00:28 running `tick(true)`, so a run the
+external job started but never finished still completes. The platform's pre-roll trigger is gone on
+purpose: firing early would claim the day and block the HTTP caller.
+
+Every run leaves a record in the store — `cron:warm` (the measured RTT) and `cron:lastRun` (job,
+day, duration) — so how far the isolate really was from the Caffi servers is checkable without the
+platform's logs:
 
 ```bash
-bunx wrangler d1 execute caffi --remote --command "SELECT value FROM records WHERE key LIKE 'caffi/meta/cron%';"
+bunx wrangler d1 execute caffi --remote \
+  --command "SELECT key, value FROM records WHERE key LIKE 'caffi meta cron%';"
 ```
 
 ### First deploy
