@@ -18,15 +18,21 @@ binding = "caffi"
 database_name = "caffi"
 database_id = "81920473-d963-4062-9c41-3319364d3de4"
 
-# One trigger only: the catch-up, as a net. The race itself is driven from
-# cron-job.com, which calls `/race` over HTTP — that is the only invocation Smart
-# Placement applies to, and the difference is the midnight ranking. A platform
-# cron at 16:56 would start the run first and block the external caller, so the
-# pre-roll is gone; this one fires 29 minutes later and only runs when the race
-# has not finished (`tick(true)`), which is exactly the "the external job died
-# mid-flight" case.
+# Two triggers, both in UTC (Vietnam is UTC+7 all year).
+#
+# `56 16 * * *` (23:56 VN) is the race. It fires three minutes early because
+# cron has minute resolution and every scheduler measured so far is late by
+# tens of seconds — Cloudflare by ~28s, cron-job.org by up to 64s, which is
+# what put two nights of check-ins at 00:01. The handler warms the
+# connections, naps the 235 seconds, and only then polls for the flip: a cron
+# invocation may run 15 minutes of wall time and sleeping costs no CPU. The
+# lead is what makes the jitter free instead of fatal.
+#
+# `28 17 * * *` (00:28 VN) is the net: it only runs when the race has not
+# finished (`tick(true)`), which is the "a run started but never completed"
+# case.
 [triggers]
-crons = ["28 17 * * *"]
+crons = ["56 16 * * *", "28 17 * * *"]
 
 # Non-secret configuration. Anything sensitive (BOT_SECRET, the Telegram and
 # Discord tokens) goes in `wrangler secret put`.

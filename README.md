@@ -245,46 +245,48 @@ cron trigger — and `src/records.ts` hides which database is behind the store:
 
 ### The schedule
 
-The check-in is triggered over HTTP, not by the platform's cron.
+|            |                                                                        |
+| ---------- | ---------------------------------------------------------------------- |
+| **Race**   | Cloudflare cron `56 16 * * *` (23:56 VN) — warm, nap 235s, then race   |
+| **Net**    | Cloudflare cron `28 17 * * *` (00:28 VN) — `tick(true)`, if unfinished |
+| **Backup** | cron-job.com calls `/race?job=pre-roll` at 00:00 VN (optional)         |
 
-|          |                                                            |
-| -------- | ---------------------------------------------------------- |
-| **Warm** | `cron-job.com` 23:59 VN → `GET /race?job=warm`             |
-| **Race** | `cron-job.com` 00:00 VN → `GET /race?job=pre-roll`         |
-| **Net**  | the platform's own catch-up cron, `28 17 * * *` (00:28 VN) |
+Cron has minute resolution, and every scheduler measured so far fires late — so the pre-roll fires
+three minutes early and the handler **naps** the rest. The nap is what turns a jittery trigger into
+an on-time one:
 
-Two jobs in cron-job.com (its job timezone is UTC; Vietnam is UTC+7):
+- Cloudflare, measured: `17:28:00` fired at **17:28:30**.
+- cron-job.com, measured: `00:00:00` fired at **00:01:04** — which is why two nights of check-ins
+  went out at 00:01 and this section was rewritten.
 
-| Job          | URL                                                    | Schedule (UTC)         |
-| ------------ | ------------------------------------------------------ | ---------------------- |
-| `caffi warm` | `https://<host>/race?job=warm&key=<WORKER_SECRET>`     | every day at **16:59** |
-| `caffi race` | `https://<host>/race?job=pre-roll&key=<WORKER_SECRET>` | every day at **17:00** |
+A cron invocation may run for 15 minutes of wall time and sleeping costs no CPU, so 235 seconds of
+nap are free. What the pre-roll then does, in order: boot, one status read per account (which pays
+the cold isolate's ~1.1s while the second is still worth nothing), nap to 23:59:55, re-warm — the
+connections idled for minutes and a server may have dropped them — and only then race: one session
+watches for the flip, every POST leaves in the same instant.
 
-**Why HTTP, when the platform has cron triggers.** Smart Placement is what holds the isolate in the
-Cloudflare colo closest to the Caffi servers (a single VNPT address in Vietnam) — and it only
-applies to **fetch handlers**. The platform's cron fires wherever Cloudflare had a spare machine,
-unplaced.
+**Why the race does not go over HTTP any more.** Smart Placement applies to fetch handlers only, so
+an HTTP trigger does end up placed near the Caffi servers while the cron handler does not. But
+placement buys _milliseconds_ and a late trigger costs _a minute_: 64 seconds late is not a trade
+worth a 200ms round trip.
 
-Worse, the cron handler used to wake `/race` on itself and could not: a Worker cannot subrequest
-itself (`workers.dev` answers 404, a custom domain 522). On 2026-10-11 the pre-roll fired at
-23:56:26 and reported Success (41.8ms CPU) while the day's check-in landed at 00:14:55 — by hand.
+The old HTTP arrangement could not have won anyway — a Worker cannot subrequest itself
+(`workers.dev` answers 404, a custom domain 522), so the cron handler's "wake `/race` over HTTP"
+never ran. On 2026-10-11 the pre-roll fired at 23:56:26, reported Success, and the day's check-in
+landed at 00:14:55 — by hand.
 
-**Why two jobs instead of one.** cron-job.com's free tier cuts a job off after 30 seconds, and its
-crontab has no seconds field — so "23:59:55" is not expressible. A job at 23:59:00 would be killed
-mid-wait. So the minute before midnight only **warms**: it boots the isolate and opens one
-connection to Caffi, because the first request from a cold isolate costs ~1.1s against ~95ms warm.
-The call at 00:00 then polls for the flip and POSTs — a couple of seconds of work.
+**cron-job.com is a backup, not the race.** Its free tier cuts a job off after 30 seconds and its
+crontab has no seconds field, so it cannot aim at 23:59:55 and it fires late; but if a platform
+trigger ever fails to propagate, a check-in at 00:01 still beats waiting for the 00:28 net. `?key=`
+carries the secret because it sends no custom headers; a bearer token and basic auth are accepted
+too.
 
-`?key=` carries the secret because cron-job.com sends no custom headers; a bearer token and basic
-auth are accepted too.
+Cloudflare needs up to 15 minutes to propagate a trigger change — worth knowing when editing
+`[triggers]`, since a new spec that "does not fire" usually has not arrived yet.
 
-**The net.** The platform keeps its catch-up trigger at 00:28 running `tick(true)`, so a run the
-external job started but never finished still completes. The platform's pre-roll trigger is gone on
-purpose: firing early would claim the day and block the HTTP caller.
-
-Every run leaves a record in the store — `cron:warm` (the measured RTT) and `cron:lastRun` (job,
-day, duration) — so how far the isolate really was from the Caffi servers is checkable without the
-platform's logs:
+Every run leaves a record in the store — `cron:warm` (the measured RTT) and `cron:lastRun` (job, nap
+length, RTT, day, duration) — so where the isolate really was and how long it slept are checkable
+without the platform's logs:
 
 ```bash
 bunx wrangler d1 execute caffi --remote \

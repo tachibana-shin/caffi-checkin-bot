@@ -171,6 +171,20 @@ check(
   `${catchUp} -> ${catchLead + 1}s before ${hhmmss(nominal + 29 * 60)} VN`,
 );
 
+// The specs are computed, `wrangler.toml` is typed by hand — the two drifting
+// apart means the platform fires a job the handler cannot identify, or omits
+// the race entirely (which is how the pre-roll went missing once already).
+const wranglerSource = await Deno.readTextFile(
+  new URL("../wrangler.toml", import.meta.url),
+);
+const cronsLine = /^\s*crons\s*=\s*\[([^\]]*)\]/m.exec(wranglerSource);
+const registered = cronsLine ? [...cronsLine[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]!) : [];
+check(
+  "wrangler.toml registers both computed cron specs",
+  registered.includes(preRoll) && registered.includes(catchUp),
+  registered.length ? registered.join(", ") : "no [triggers] crons found",
+);
+
 /** A Date reading `secondsOfDay` seconds past midnight in Vietnam, 2026-10-07. */
 function atVn(secondsOfDay: number): Date {
   return new Date(Date.UTC(2026, 9, 7) + (secondsOfDay - 7 * 3600) * 1000);
