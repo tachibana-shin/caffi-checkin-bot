@@ -284,14 +284,24 @@ too.
 Cloudflare needs up to 15 minutes to propagate a trigger change — worth knowing when editing
 `[triggers]`, since a new spec that "does not fire" usually has not arrived yet.
 
-Every run leaves a record in the store — `cron:warm` (the measured RTT) and `cron:lastRun` (job, nap
-length, RTT, day, duration) — so where the isolate really was and how long it slept are checkable
-without the platform's logs:
+Every run leaves a trace in the store: `cron:warm` (the measured RTT) and `cron:runs`, a ring buffer
+of the last dozen fires from the platform cron **and** the HTTP race alike — job, who fired it, when
+the trigger landed, nap length, RTT, and what the attempt found: `skipped` (outside the window or
+already booked), `booked <date>`, or `unfinished: <reason>` per account. `cron:lastRun` still points
+at the newest entry, but it is no longer the only one: the catch-up at 00:28 used to overwrite
+whatever the pre-roll at 23:56 had to say, which is exactly what made 13→14 Oct unexplainable.
 
 ```bash
 bunx wrangler d1 execute caffi --remote \
   --command "SELECT key, value FROM records WHERE key LIKE 'caffi meta cron%';"
 ```
+
+**A day is marked finished only when every account is in.** On 13→14 Oct an attempt completed
+without a single check-in landing — the marker went down anyway, so the HTTP race at 00:01 and the
+catch-up at 00:28 were both turned away and the day was lost. A failed POST, or a day the server
+never opened before the window closed, now leaves the marker off and drops the "already started"
+guard, so the next trigger of the same night may retry it. The 00:28 catch-up still runs with
+`force`, which is the net.
 
 ### First deploy
 

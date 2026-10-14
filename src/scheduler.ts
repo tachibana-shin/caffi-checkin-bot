@@ -174,14 +174,76 @@ export function msUntilWindow(now: Date): number {
   return delta < 0 || delta > MAX_PRE_ROLL_SLEEP ? 0 : delta;
 }
 
+/** What one attempt actually did — the whole reason a day can be retried. */
+export interface RunReport {
+  /** The VN date the attempt was checking in for. */
+  date: string;
+  /** How many accounts ended on each outcome. */
+  counts: Record<string, number>;
+  /**
+   * Every account is in, so the day may be marked finished.
+   *
+   * A POST that failed, or a day the server had not opened before the window
+   * closed, is *not* finished — 13→14 Oct the run reported "done" without a
+   * single check-in landing, which set the guard and stopped the catch-up from
+   * saving the day. Only a report that says otherwise is allowed to do that.
+   */
+  allDone: boolean;
+  /** One line per account still standing between the day and being booked. */
+  unfinished: string[];
+}
+
+// ── Traces ────────────────────────────────────────────────────────────────
+
+/** One trigger fire, as the next morning can read it back. */
+export interface RunTrace {
+  job: string;
+  /** `cron` for the platform trigger, `http` for the cron-job.com race. */
+  via: "cron" | "http";
+  /** Wall time of the whole invocation. */
+  ms: number;
+  at?: string;
+  /** The cron expression that fired, when the platform drove it. */
+  cron?: string;
+  firedAt?: string;
+  napMs?: number;
+  /** Null when no account could be warmed. */
+  rttMs?: number | null;
+  /** Null when the attempt was skipped (outside the window, day already booked). */
+  report?: RunReport | null;
+  doneDate?: string;
+  error?: string;
+}
+
+/**
+ * Leave a trace the next day can be reasoned from.
+ *
+ * `cron:lastRun` only ever holds the newest write, so the catch-up at 00:28
+ * overwrote whatever the pre-roll at 23:56 had to say — on the night of
+ * 13→14 Oct the check-in never landed and the record could not say which
+ * trigger had run, or what it thought it accomplished. `cron:runs` keeps the
+ * last dozen instead, from the platform cron and the HTTP race alike, and
+ * `cron:lastRun` still points at the newest one.
+ */
+export async function recordRun(trace: RunTrace): Promise<void> {
+  const entry: RunTrace = { at: new Date().toISOString(), ...trace };
+  const runs = (await store.meta<RunTrace[]>("cron:runs")) ?? [];
+  await store.setMeta("cron:runs", [entry, ...runs].slice(0, 12));
+  await store.setMeta("cron:lastRun", entry);
+}
+
 // ── Runner ─────────────────────────────────────────────────────────────────
 
 export interface SchedulerRunner {
   /**
    * One attempt. `force` lets a catch-up run retry a day whose attempt was
    * started but never finished (the isolate was recycled, the network died).
+   *
+   * Returns null when there was nothing to do (outside the window, the day is
+   * already booked, or another attempt holds it), and the report of what the
+   * run found otherwise.
    */
-  tick(force?: boolean): Promise<void>;
+  tick(force?: boolean): Promise<RunReport | null>;
 }
 
 export function createRunner(tg: Sender): SchedulerRunner {
@@ -189,24 +251,40 @@ export function createRunner(tg: Sender): SchedulerRunner {
 
   return {
     async tick(force = false) {
-      if (running) return;
+      if (running) return null;
 
       const plan = planRun(new Date());
-      if (!plan) return;
+      if (!plan) return null;
       // Finished is finished — no cron, no restart, no amount of ticking re-runs it.
-      if (store.data.lastAutoRunDoneDate === plan.runDate) return;
-      if (!force && store.data.lastAutoRunDate === plan.runDate) return;
+      if (store.data.lastAutoRunDoneDate === plan.runDate) return null;
+      if (!force && store.data.lastAutoRunDate === plan.runDate) return null;
 
       running = true;
       store.data.lastAutoRunDate = plan.runDate;
       store.touch();
 
       try {
-        await runDaily(tg, plan.runDate, plan.retryUntil);
-        store.data.lastAutoRunDoneDate = plan.runDate;
+        const report = await runDaily(tg, plan.runDate, plan.retryUntil);
+        if (report.allDone) {
+          store.data.lastAutoRunDoneDate = plan.runDate;
+        } else {
+          // The day is not in the books, so drop the marker that would keep the
+          // next trigger of the same day out: the HTTP race at 00:01 and the
+          // catch-up at 00:28 are exactly the retries this is for.
+          store.data.lastAutoRunDate = undefined;
+        }
         store.touch();
+        return report;
       } catch (e) {
         console.error(`[scheduler] run failed for ${plan.runDate}:`, e);
+        store.data.lastAutoRunDate = undefined;
+        store.touch();
+        return {
+          date: plan.runDate,
+          counts: {},
+          allDone: false,
+          unfinished: [e instanceof Error ? e.message : String(e)],
+        };
       } finally {
         running = false;
       }
@@ -236,12 +314,13 @@ export function preRollNap(): number {
   return msUntilWindow(new Date());
 }
 
-async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<void> {
+async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<RunReport> {
+  const report: RunReport = { date, counts: {}, allDone: true, unfinished: [] };
   const targets = store.autoAccounts();
   const invalid = store.invalidAccounts();
   if (!targets.length && !invalid.length) {
     console.log(`[scheduler] ${date}: no auto-enabled accounts.`);
-    return;
+    return report;
   }
 
   console.log(
@@ -258,6 +337,14 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<v
   const midnight = vnMidnightMs(date);
   for (const { chatId, account, result: r } of results) {
     console.log(`[scheduler] ${account.username}: ${r.outcome}`);
+    report.counts[r.outcome] = (report.counts[r.outcome] ?? 0) + 1;
+    // A POST that failed or a day the server never opened can still be fixed
+    // later in the same night, so they leave the door open. A session the
+    // server dropped cannot — it waits for /login and must not hold the day.
+    if (r.outcome === "failed" || r.outcome === "pending_day") {
+      report.allDone = false;
+      report.unfinished.push(`${account.username}: ${r.card.subtitle ?? r.outcome}`);
+    }
     // The whole pre-roll exists to land this POST as close to 00:00 as it can.
     if (r.postedAt !== undefined) {
       const delta = r.postedAt - midnight;
@@ -294,6 +381,8 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<v
       footer: "Bot sẽ KHÔNG tự điểm danh cho tới khi bạn đăng nhập lại.",
     });
   }
+
+  return report;
 }
 
 async function safeSend(tg: Sender, chatId: string, card: Card) {

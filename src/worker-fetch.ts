@@ -105,20 +105,35 @@ async function race(req: Request): Promise<Response> {
   }
 
   const catchUp = job === "catch-up";
-  const { createRunner, preRollCronSpec, catchUpCronSpec } = await import("./scheduler.ts");
+  const { createRunner, preRollCronSpec, catchUpCronSpec, recordRun } = await import(
+    "./scheduler.ts"
+  );
 
   const spec = catchUp ? catchUpCronSpec() : preRollCronSpec();
   const { fanOut } = await booted();
   const runner = createRunner(fanOut);
   // `force` is what lets the catch-up job finish a run the pre-roll started but
   // never completed (an isolate recycled mid-flight).
-  await runner.tick(catchUp);
+  const report = await runner.tick(catchUp);
   await store.flush();
+
+  // This is the path cron-job.com drives, and on 13→14 Oct it was the only
+  // trigger that answered and still left no check-in. It now says what it saw.
+  await recordRun({
+    job,
+    via: "http",
+    report,
+    doneDate: store.data.lastAutoRunDoneDate,
+    ms: Date.now() - startedAt,
+  });
 
   const ms = Date.now() - startedAt;
   const placement = req.headers.get("cf-placement") ?? "no placement header";
-  console.log(`🏁 race (${spec}) ${ms}ms · ${placement} · day ${store.data.lastAutoRunDoneDate}`);
-  return new Response(`ok ${ms}ms · ${placement}`, { status: 200 });
+  const outcome = report === null ? "skipped" : report.allDone ? "booked" : "unfinished";
+  console.log(
+    `🏁 race (${spec}) ${ms}ms · ${placement} · ${outcome} · day ${store.data.lastAutoRunDoneDate}`,
+  );
+  return new Response(`ok ${ms}ms · ${placement} · ${outcome}`, { status: 200 });
 }
 
 /**

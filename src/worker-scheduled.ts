@@ -24,7 +24,14 @@
  */
 import { apiFor, sleep } from "./checkin.ts";
 import { boot } from "./boot.ts";
-import { catchUpCronSpec, createRunner, preRollCronSpec, preRollNap } from "./scheduler.ts";
+import {
+  catchUpCronSpec,
+  createRunner,
+  preRollCronSpec,
+  preRollNap,
+  recordRun,
+  type RunReport,
+} from "./scheduler.ts";
 import { store } from "./store.ts";
 import type { ScheduledController, WorkerEnv } from "./worker.ts";
 
@@ -36,7 +43,17 @@ export async function handleScheduled(controller: ScheduledController, _env: Wor
   try {
     await boot();
   } catch (e) {
+    // Before, this returned without leaving a trace — the one failure mode
+    // that looked exactly like "the trigger never fired".
     console.error("[scheduled] boot failed:", e);
+    await recordRun({
+      job,
+      via: "cron",
+      cron,
+      firedAt: new Date(startedAt).toISOString(),
+      error: `boot: ${e instanceof Error ? e.message : String(e)}`,
+      ms: Date.now() - startedAt,
+    }).catch(() => {});
     return;
   }
 
@@ -69,30 +86,45 @@ export async function handleScheduled(controller: ScheduledController, _env: Wor
 
   try {
     const { fanOut } = await boot();
-    await createRunner(fanOut).tick(job === "catch-up");
+    const report: RunReport | null = await createRunner(fanOut).tick(job === "catch-up");
+    // The day markers first: a trace written twice is history, a marker lost
+    // with the isolate is a whole day.
     await store.flush();
 
-    const run = {
+    await recordRun({
       job,
+      via: "cron",
       cron,
       firedAt: new Date(startedAt).toISOString(),
-      at: new Date().toISOString(),
       napMs,
       rttMs,
+      report,
       doneDate: store.data.lastAutoRunDoneDate,
       ms: Date.now() - startedAt,
-    };
-    await store.setMeta("cron:lastRun", run);
+    });
+
+    const outcome = report === null
+      ? "skipped"
+      : report.allDone
+      ? `booked ${report.date}`
+      : `unfinished: ${report.unfinished.join("; ")}`;
     console.log(
-      `🏁 ${job} done in ${run.ms}ms · nap ${napMs}ms · rtt ${rttMs}ms · day ${run.doneDate}`,
+      `🏁 ${job} done in ${
+        Date.now() - startedAt
+      }ms · nap ${napMs}ms · rtt ${rttMs}ms · ${outcome}`,
     );
   } catch (e) {
     console.error("[scheduled] race failed:", e);
-    await store.setMeta("cron:lastError", {
+    await recordRun({
       job,
+      via: "cron",
       cron,
-      at: new Date().toISOString(),
+      firedAt: new Date(startedAt).toISOString(),
+      napMs,
+      rttMs,
+      doneDate: store.data.lastAutoRunDoneDate,
       error: e instanceof Error ? e.message : String(e),
+      ms: Date.now() - startedAt,
     }).catch(() => {});
   }
 }
