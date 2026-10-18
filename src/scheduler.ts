@@ -191,6 +191,13 @@ export interface RunReport {
   allDone: boolean;
   /** One line per account still standing between the day and being booked. */
   unfinished: string[];
+  /**
+   * When each winning POST left, in ms relative to 00:00 (negative = sent
+   * before midnight, which the grid does on purpose). The number the
+   * leaderboard ranks passes through here on its way into `cron:runs`, so the
+   * grid geometry can be tuned from the traces alone.
+   */
+  posted?: Record<string, number>;
 }
 
 // ── Traces ────────────────────────────────────────────────────────────────
@@ -327,10 +334,11 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<R
     `[scheduler] ${date}: ${targets.length} check-ins, ${invalid.length} expired sessions.`,
   );
 
-  // One session watches for the server to open the day, then every POST goes
-  // out in the same Promise.all. Letting each account wake up at midnight and
-  // find the flip on its own cost each of them a full round trip and spread
-  // them a second apart — 09-10-2026: rank 3 at 00:00:00, rank 10 at 00:00:01.
+  // The batch is the only run with something to win: before midnight every
+  // account fires a blind grid of POSTs across the flip, all anchored to the
+  // same instants, and the first shot to land after the server turns the day
+  // is the check-in. Waiting for a read to *show* the flip cost one round trip
+  // on a ~265ms connection — which was the whole race.
   const results = await runCheckInAll(targets, { runDate: date, retryUntil });
 
   const sends: Array<Promise<void>> = [];
@@ -348,6 +356,7 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<R
     // The whole pre-roll exists to land this POST as close to 00:00 as it can.
     if (r.postedAt !== undefined) {
       const delta = r.postedAt - midnight;
+      (report.posted ??= {})[account.username] = delta;
       console.log(
         `[scheduler] ${account.username}: POST ${delta >= 0 ? "+" : ""}${delta}ms after 00:00`,
       );

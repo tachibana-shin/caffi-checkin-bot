@@ -44,24 +44,21 @@ async function telegram(req: Request): Promise<Response> {
 /**
  * The midnight check-in, as an HTTP call.
  *
- * The cron handler invokes this on itself for one reason: Smart Placement only
- * applies to fetch handlers, so running the race here is what puts the isolate
- * next to the Caffi servers instead of wherever the scheduler woke up.
+ * cron-job.com drives this at 00:00 as a backup for the platform trigger — its
+ * free tier cuts a job off after 30 seconds and its crontab has no seconds
+ * field, so it cannot aim at 23:59:55, but a check-in at 00:01 still beats
+ * waiting for the 00:28 net.
+ *
+ * Smart Placement applies to fetch handlers only, so this path runs placed next
+ * to the Caffi servers while the cron handler does not — but the blind grid is
+ * bounded by its own spacing, not by the round trip, so placement only makes
+ * the confirm reads faster, never the ranking.
  *
  * The bearer token is WORKER_SECRET (BOT_SECRET when unset). Without it anyone
  * could force a run — the store's per-day markers would stop a real double
- * check-in, but there is no reason to accept the traffic.
- */
-/**
- * The midnight check-in, as an HTTP call.
- *
- * Smart Placement only applies to fetch handlers, so an HTTP caller is what gets
- * the isolate held next to the Caffi servers — and that is the whole race. It is
- * also why the schedule is driven from cron-job.com instead of the platform's
- * cron triggers: those fire unplaced, and this is the one job that must not.
- *
- * cron-job.com sends no custom headers, so the secret is accepted as a bearer
- * token, as basic auth, or as `?key=` — whichever the job is configured with.
+ * check-in, but there is no reason to accept the traffic. cron-job.com sends no
+ * custom headers, so the secret is accepted as a bearer token, as basic auth,
+ * or as `?key=` — whichever the job is configured with.
  */
 async function race(req: Request): Promise<Response> {
   const url = new URL(req.url);

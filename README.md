@@ -99,9 +99,10 @@ window.
 
 The fastest check-in of the day earns a bigger reward. The server's own
 `GET /api/v2/xeng/check-in/earliest` returns today's top 10, and it answers both open questions
-directly: the day flips at **exactly 00:00:00.000 VN** (first place arrived at **+134ms**) and 10th
-place still needed ~2.9s. So the bot **wakes up before** the scheduled time instead of at it, and
-polls in 50ms steps across the flip rather than once a second.
+directly: the day flips at **exactly 00:00:00.000 VN** and first place sits a couple of hundred
+milliseconds later (**+134ms** and **+263ms** on two measured nights), while 10th place still needed
+~2.9s. So the bot **wakes up before** the scheduled time instead of at it — and it does not wait to
+_see_ the flip at all: it fires a blind grid of POSTs across it.
 
 | Env var                    | Default | Meaning                                                                           |
 | -------------------------- | ------- | --------------------------------------------------------------------------------- |
@@ -110,38 +111,59 @@ polls in 50ms steps across the flip rather than once a second.
 
 What happens at run time (`runCheckIn` for one account, `runCheckInAll` for the nightly batch):
 
-1. `GET /check-in/status`.
-2. `todayCheckedIn === false` → the server opened the new day → `POST /check-in` **immediately**.
-3. `todayCheckedIn === true` but the newest `history[].checkInDate` is still _before_ the target day
-   → the clock has not rolled over yet → poll again. The cadence comes from `pollDelay`: **50ms**
-   across the two seconds either side of the deadline (first place on the server's own `earliest`
-   leaderboard sits at +134ms), then 1s for the first 20s, then 10s.
-4. A premature `POST` that the server rejects is retried the same way, until
-   `CHECKIN_MAX_WAIT_SECONDS` elapses. Rate-limited responses are _not_ retried.
-5. After a successful `POST` the status is read back until it actually reflects it — the wallet row
-   is written ~200ms before the check-in row, so the very first read can still return the previous
-   streak (observed: it answered 3 when the correct value was 4).
+1. Before midnight (`runCheckInAll`), each account **fires a short grid of `POST /check-in`**
+   anchored to midnight (`sprintShots`): the first shot leaves 900ms before 00:00, then one every
+   200ms for two seconds — ten in total, and a second account interleaves halfway between shots.
+   Every shot that lands _before_ the flip is answered "Hôm nay bạn đã điểm danh rồi" (the previous
+   day is still today, and it is done); the first shot that lands _after_ it **is** the check-in.
+   What bounds the arrival is the grid spacing, not the round trip: a 90ms connection and a 265ms
+   one score the same instant. Measured 15–18 Oct 2026, the read-then-POST version of this race
+   landed **+582…+1215ms** past midnight while first place sat at +263ms. One status read goes out
+   before the grid — five seconds early, off the critical path — to answer a different question: is
+   the day the server calls "today" already booked? It normally is, and then every pre-flip shot can
+   only be answered "already done", which is what makes a 200 readable as the flip.
+2. A 200 wins and cancels the rest of its grid — provided the pre-race read vouched for the day. If
+   it could not (the read failed, or it showed yesterday was never booked), the shot's own
+   `history[].checkInDate` must reach `runDate` first (`OPEN (verified)`). The status is then read
+   back until it actually reflects the check-in — the wallet row is written ~200ms before the
+   check-in row, so the very first read can still return the previous streak (observed: it answered
+   3 when the correct value was 4).
+3. A grid that never sees 200 — a server clock further from ours than the grid assumes — falls back
+   to `runCheckIn`, which reads first: `todayCheckedIn === false` → the day opened →
+   `POST
+   /check-in` **immediately**; otherwise, while the newest `history[].checkInDate` is still
+   _before_ the target day, it keeps re-reading — **50ms** across the two seconds either side of the
+   deadline, then 1s for the first 20s, then 10s (`pollDelay`). A premature `POST` that the server
+   rejects is retried the same way, until `CHECKIN_MAX_WAIT_SECONDS` elapses. Rate-limited responses
+   are _not_ retried.
+4. A run that starts once the day is already open — a restart, the catch-up cron, a re-run — cannot
+   race anyone, so each account answers on its own session and "already checked in" is honoured per
+   login.
+5. Access tokens are refreshed up front (`CaffiApi.warm`) when their JWT `exp` is near: a 401-driven
+   refresh costs two extra round trips, and they must not land on the grid.
 
-**Several accounts, one race.** One account's session watches for the flip (`waitForDayOpen`); the
-moment it lands, **every** `POST` is issued from the same `Promise.all`, with the per-account status
-read skipped on purpose. That read is one round trip (~265ms from the `ord`/`ams` regions to the
-Caffi servers in Vietnam), and one read per account is exactly what used to cost the ranking:
-measured on 2026-10-09, the account that had been watching since the pre-roll got **rank 3 at
-00:00:00** while the one that woke up at midnight and had to discover the flip by itself got **rank
-10 at 00:00:01** — a round trip of distance between two check-ins that should have been
-simultaneous. One poller also keeps the request rate at one session instead of N.
+**Why a grid, and why blind.** The flip is only visible inside a status response, so a POST sent
+after seeing it leaves one full round trip after the server has already opened — on a ~265ms link
+that is most of the ranking, and it is why 2026-10-09 put one account at rank 3 / 00:00:00 and the
+next at rank 10 / 00:00:01. Midnight itself needs no reading: it is a fixed epoch per `runDate`. So
+instead of waiting for the flip to be _seen_, the grid _arrives_ at it: the first shot leaves 900ms
+early (a server clock ahead of ours is still scored) and the grid runs 900ms past midnight (a clock
+behind by up to a second still finds a shot after the flip). Every shot but the winner costs one
+rejected duplicate lookup, and the winner cancels the rest. A grid that never sees 200 falls back to
+read-and-post, which is what keeps a clock surprise from losing the day. The geometry is pinned in
+`scripts/timing.ts`; `scripts/batch.ts` replays the whole night offline against a stubbed Caffi.
 
-The watch itself is pipelined: three reads stay in flight, so a reader that waits for its own
-response cannot miss the flip for two round trips. The pre-roll also makes one read per account
-**before** it naps — a cold isolate's first request to Caffi costs ~1.1s against ~265ms warm, and on
-09-10 that cold start was most of the +1730ms the server recorded.
+A missed night is the one wrinkle: if yesterday was never booked, the server's "today" is still
+yesterday, and the first shot of the grid books **it** — a 200 that would otherwise look like
+tonight's win and cancel the shots that book tonight. That is what the pre-race read is for, and why
+a dubious 200 is settled by the history date: a shot that books yesterday is logged as
+`booked an earlier day` and the grid keeps firing. If a wrong-day 200 ever slips through, the day is
+reported unfinished (`pending_day`) rather than marked done, so the 00:28 catch-up finishes it —
+never a night lost to a misread 200.
 
-A run that starts when the day is already open — a restart, the catch-up cron, a re-run — cannot
-race anyone, so `runCheckInAll` asks each account on its own session instead and honours "already
-checked in" per login. If the watcher's session is dead the watch passes to the next account, and a
-POST that still answers "day not open" falls back to that account's own `runCheckIn` loop. Access
-tokens are refreshed up front (`CaffiApi.warm`) when their JWT `exp` is near: a 401-driven refresh
-costs two extra round trips, which must not land on the POST being timed.
+The pre-roll also makes one read per account **before** it naps — a cold isolate's first request to
+Caffi costs ~1.1s against ~265ms warm, and on 09-10 that cold start was most of the +1730ms the
+server recorded.
 
 The run is keyed by the **target day**, not by the wall clock, so a run that starts at 23:59:55 and
 one that continues at 00:00:03 count as the same run — no double check-in across midnight.
@@ -245,11 +267,11 @@ cron trigger — and `src/records.ts` hides which database is behind the store:
 
 ### The schedule
 
-|            |                                                                        |
-| ---------- | ---------------------------------------------------------------------- |
-| **Race**   | Cloudflare cron `56 16 * * *` (23:56 VN) — warm, nap 235s, then race   |
-| **Net**    | Cloudflare cron `28 17 * * *` (00:28 VN) — `tick(true)`, if unfinished |
-| **Backup** | cron-job.com calls `/race?job=pre-roll` at 00:00 VN (optional)         |
+|            |                                                                          |
+| ---------- | ------------------------------------------------------------------------ |
+| **Race**   | Cloudflare cron `56 16 * * *` (23:56 VN) — warm, nap 235s, then the grid |
+| **Net**    | Cloudflare cron `28 17 * * *` (00:28 VN) — `tick(true)`, if unfinished   |
+| **Backup** | cron-job.com calls `/race?job=pre-roll` at 00:00 VN (optional)           |
 
 Cron has minute resolution, and every scheduler measured so far fires late — so the pre-roll fires
 three minutes early and the handler **naps** the rest. The nap is what turns a jittery trigger into
@@ -262,13 +284,14 @@ an on-time one:
 A cron invocation may run for 15 minutes of wall time and sleeping costs no CPU, so 235 seconds of
 nap are free. What the pre-roll then does, in order: boot, one status read per account (which pays
 the cold isolate's ~1.1s while the second is still worth nothing), nap to 23:59:55, re-warm — the
-connections idled for minutes and a server may have dropped them — and only then race: one session
-watches for the flip, every POST leaves in the same instant.
+connections idled for minutes and a server may have dropped them — and only then fire the blind
+grid: each account's shots start 900ms before midnight and land every 200ms, and the first one after
+the flip is the check-in.
 
 **Why the race does not go over HTTP any more.** Smart Placement applies to fetch handlers only, so
-an HTTP trigger does end up placed near the Caffi servers while the cron handler does not. But
-placement buys _milliseconds_ and a late trigger costs _a minute_: 64 seconds late is not a trade
-worth a 200ms round trip.
+an HTTP trigger does end up placed near the Caffi servers while the cron handler does not. But the
+grid is bounded by its own spacing, not by the round trip, so placement no longer decides the race —
+while a late trigger still costs a minute: 64 seconds late is not a trade worth a 200ms round trip.
 
 The old HTTP arrangement could not have won anyway — a Worker cannot subrequest itself
 (`workers.dev` answers 404, a custom domain 522), so the cron handler's "wake `/race` over HTTP"
@@ -370,11 +393,11 @@ nohup deno task start > bot.log 2>&1 &
 ```bash
 deno task check         # type check
 deno task lint
-deno task timing        # offline: midnight window, poll cadence, check-in decision rules
+deno task timing        # offline: midnight window, grid geometry, poll cadence, decision rules
 deno task view          # offline: every screen rendered as Telegram HTML
 deno task wiring        # offline grammY routing test (no Telegram calls)
 deno task smoke         # store encryption round-trip + live API error branches
-deno task batch         # offline: the nightly batch — one watcher, POSTs together
+deno task batch         # offline: the nightly batch — the blind grid across a stubbed midnight
 deno task deploycheck   # offline pre-flight + live probes once PUBLIC_URL is in .env
 ```
 

@@ -3,8 +3,9 @@
  *
  * Covers (1) the window arithmetic in `planRun` (wake-up boundary, catch-up,
  * giving up), (2) `decideFromStatus`, the rule that tells "the server has not
- * opened the new day yet" apart from "already checked in", and (3) `pollDelay`,
- * the cadence that decides how fast the bot notices the day has flipped.
+ * opened the new day yet" apart from "already checked in", (3) `pollDelay`,
+ * the cadence that decides how fast a lost race notices the flip, and (4) the
+ * geometry of the blind grid that actually wins the race (`sprintShots`).
  * Vietnam is UTC+7 with no DST, so wall times below are exact.
  *
  *   deno task timing
@@ -14,7 +15,7 @@ Deno.env.set("BOT_SECRET", "timing-secret");
 Deno.env.set("DATA_DIR", "/tmp/opencode/caffi-timing");
 
 const { planRun } = await import("../src/scheduler.ts");
-const { checkedInAtOf, decideFromStatus, pollDelay, vnMidnightMs } = await import(
+const { checkedInAtOf, decideFromStatus, pollDelay, sprintShots, vnMidnightMs } = await import(
   "../src/checkin.ts"
 );
 type ScheduleSettings = import("../src/scheduler.ts").ScheduleSettings;
@@ -193,6 +194,39 @@ function secondsLeft(plan: ReturnType<typeof planRun>, now: Date): number | null
     pollDelay(target, lateStart + 500, lateStart) === 1_000,
     String(pollDelay(target, lateStart + 500, lateStart)),
   );
+}
+
+// ── The blind grid across midnight ───────────────────────────────────────
+{
+  const midnight = vnMidnightMs("2026-10-07");
+  // The pre-roll enters the grid about 4.5s before midnight.
+  const shots = sprintShots(midnight, midnight - 4_500, 0);
+  check("the grid is ten shots", shots.length === 10, String(shots.length));
+  check(
+    "the first shot leaves 900ms before midnight",
+    shots[0] === midnight - 900,
+    `${shots[0]! - midnight}ms`,
+  );
+  check(
+    "the last shot lands 900ms after midnight — a server clock behind ours is still caught",
+    shots[shots.length - 1]! - midnight === 900,
+    `${shots[shots.length - 1]! - midnight}ms`,
+  );
+  check(
+    "shots are 200ms apart",
+    shots.every((t, i) => i === 0 || t - shots[i - 1]! === 200),
+  );
+  const second = sprintShots(midnight, midnight - 4_500, 1);
+  check(
+    "the second account interleaves halfway between shots",
+    second[0] === midnight - 800,
+    `${second[0]! - midnight}ms`,
+  );
+  // A run that starts late anchors the grid at "now": it still crosses
+  // midnight, just with less runway.
+  const late = sprintShots(midnight, midnight - 100, 0);
+  check("a late start fires at once", late[0] === midnight - 100, `${late[0]! - midnight}ms`);
+  check("…and still crosses midnight", late.some((t) => t > midnight));
 }
 
 // ── Reporting the check-in time from the server's own record ─────────────

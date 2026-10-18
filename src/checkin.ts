@@ -85,11 +85,11 @@ export function vnMidnightMs(runDate: string): number {
 /**
  * How long to wait before re-reading the status.
  *
- * The `earliest` leaderboard puts first place at +134ms past midnight, so a 1s
- * poll can only ever land near +500ms (about 4th). Polling every 50ms across the
- * couple of seconds either side of the deadline shrinks the window in which the
- * day can flip unnoticed to under 100ms.
- * Everywhere else backs off to 1s, then 10s, so a slow server costs nothing.
+ * This is the fallback cadence, `runCheckIn`'s retry loop — the nightly batch
+ * does not poll at all (it fires the blind grid below). It decides how fast a
+ * run that lost the grid notices that the day has opened: 50ms across the two
+ * seconds either side of the deadline, then 1s for the first 20s, then 10s, so
+ * a slow server costs nothing.
  */
 export function pollDelay(targetMs: number, nowMs: number, startedAtMs: number): number {
   if (nowMs > targetMs - FINE_BEFORE_MS && nowMs < targetMs + FINE_AFTER_MS) {
@@ -145,120 +145,175 @@ export async function runCheckIn(
   }
 }
 
-/** How `waitForDayOpen` learned that the server has opened the day. */
-type DayOpenMode = "race" | "catch_up";
+/**
+ * The blind grid — how the nightly race is won.
+ *
+ * Reading the flip cannot be fast enough. The day only turns inside a status
+ * response, so a POST sent when a read *shows* the flip leaves one full round
+ * trip after the server has already opened its day: measured 15-18 Oct 2026,
+ * the read-then-POST race landed +582ms..+1215ms past midnight while first
+ * place on the leaderboard sat at +263ms. Midnight itself needs no reading — it
+ * is `vnMidnightMs(runDate)`, a fixed instant on the clock — so the batch does
+ * not wait for the flip to be *seen*; it *arrives* at it. Each account fires a
+ * short grid of POSTs across midnight: every shot that lands before the flip
+ * answers "đã điểm danh hôm nay" (the previous day is still today, and it is
+ * done), and the first shot that lands after it *is* the check-in. What bounds
+ * the arrival is the grid spacing, not the round trip — a 90ms connection and a
+ * 265ms one score the same instant.
+ *
+ * The geometry, midnight at T:
+ *   - the first shot leaves `SPRINT_LEAD_MS` before T, so a server clock ahead
+ *     of ours is still scored;
+ *   - shots follow every `SPRINT_GAP_MS`, `SPRINT_SHOTS` of them, so a server
+ *     clock behind by a second still finds a shot after the flip;
+ *   - the next account's grid is offset half a gap, so two accounts interleave
+ *     instead of doubling up on the same instants.
+ *
+ * The grid sounds trigger-happy; it is not. Every shot but the winner costs one
+ * rejected duplicate lookup, and a shot that answers 200 cancels the rest. A
+ * grid that never sees 200 falls back to read-and-post, which is what keeps a
+ * clock surprise from losing the day.
+ *
+ * One wrinkle the grid cannot ignore: a 200 only says "the day the server calls
+ * today is booked", and before the flip its today is *yesterday*. If yesterday
+ * was missed, the first shot books **it** — and standing down there skips the
+ * night. So one status read goes out before the grid ("is yesterday already
+ * booked?", normally yes) and decides whether a 200 can be trusted; when it
+ * cannot, the shot's own `history[].checkInDate` decides before the grid stands
+ * down.
+ */
+const SPRINT_LEAD_MS = 900;
+const SPRINT_GAP_MS = 200;
+const SPRINT_STAGGER_MS = SPRINT_GAP_MS / 2;
+const SPRINT_SHOTS = 10;
 
 /**
- * How many status reads to keep in flight while the window is near.
+ * Epoch-ms instants one account's blind POSTs leave, with midnight at `targetMs`.
  *
- * One round trip to Caffi is ~265ms, so a reader that waits for its own
- * response can only sample the server every ~300ms: the day may flip and stay
- * invisible until the next read comes back — up to two round trips late, which
- * is what put 09-10 at +1730ms. Keeping a few readers going turns every
- * response into a fresh sample, so the flip surfaces within one round trip of
- * happening. Six simultaneous connections is the Cloudflare ceiling, so three
- * leaves room for the POSTs that follow.
+ * `startedAtMs` is when the run entered the grid: normally seconds before
+ * midnight, so the first shot waits for `T - SPRINT_LEAD_MS`. A run that starts
+ * *late* (a slow wake-up, a re-run already near the hour) anchors the grid at
+ * "now" instead — it still crosses midnight, it just has less runway.
  */
-const WATCH_PIPELINE = 3;
-
-/**
- * One session watches the server until it counts `runDate` as today.
- *
- * Nothing else can answer "is it midnight on the server yet": the flip is only
- * visible in a status read. Sharing the watch is what makes every POST land
- * together — on its own each account pays for the discovery, and with a ~250ms
- * round trip to the Caffi servers that is the whole race: measured on
- * 2026-10-09 the account that watched from the pre-roll got rank 3 at
- * 00:00:00 while the one that woke up at midnight and had to look for itself
- * got rank 10 at 00:00:01.
- *
- * Returns `"race"` when the day flipped while we were waiting — nobody has
- * checked in for it yet — and `"catch_up"` when it was already open, which
- * means each account has to answer "already done?" for itself.
- */
-async function waitForDayOpen(
-  api: CaffiApi,
-  runDate: string,
-  deadline: number,
-): Promise<DayOpenMode | null> {
-  const targetMs = vnMidnightMs(runDate);
-  const startedAt = Date.now();
-  let reads = 0;
-  /** What the first reader to learn the truth found. */
-  let verdict: DayOpenMode | "dead" | undefined;
-
-  const reader = async (slot: number): Promise<void> => {
-    // Stagger the first read so the readers do not all sample the same instant.
-    if (slot > 0) await sleep(slot * 50);
-    while (verdict === undefined) {
-      reads++;
-      try {
-        const s = await api.getCheckInStatus();
-        // "check_in" (fresh day, not yet taken) and "already_done" (this account
-        // is in) both mean the day is open; only the previous day blocks.
-        if (decideFromStatus(s, runDate) !== "pending_day") {
-          // The first batch is the very first look we took — the day was
-          // already open. Anything after it means the flip happened while we
-          // were watching, which is the race.
-          verdict = reads <= WATCH_PIPELINE ? "catch_up" : "race";
-          return;
-        }
-      } catch (e) {
-        if (e instanceof SessionExpiredError) {
-          verdict = "dead";
-          return;
-        }
-        // A dropped read is not a verdict: keep watching.
-      }
-      if (Date.now() >= deadline) return;
-      await sleep(pollDelay(targetMs, Date.now(), startedAt));
-    }
-  };
-
-  await Promise.all(Array.from({ length: WATCH_PIPELINE }, (_, slot) => reader(slot)));
-
-  if (verdict === "dead") throw new SessionExpiredError("Phiên đã hết hạn");
-  if (verdict === undefined) return null; // the window closed on an open question
-  return verdict;
+export function sprintShots(targetMs: number, startedAtMs: number, slot: number): number[] {
+  const base = Math.max(startedAtMs, targetMs - SPRINT_LEAD_MS) + slot * SPRINT_STAGGER_MS;
+  return Array.from({ length: SPRINT_SHOTS }, (_, k) => base + k * SPRINT_GAP_MS);
 }
 
+/** "+"/"-" sign of a delta in ms, for the grid log. */
+const signed = (ms: number): string => `${ms >= 0 ? "+" : ""}${ms}`;
+
 /**
- * The POST itself, with the status read skipped on purpose.
+ * One account's grid, from the first shot to a confirmed check-in.
  *
- * Only safe once `waitForDayOpen` has seen the flip: a read costs one round
- * trip (~250ms to Vietnam), and one read per account is exactly what used to
- * spread the accounts a second apart. `postedAt` is stamped the moment the
- * request leaves, so the log measures what the leaderboard ranks.
+ * The grid is blind — no read stands between the clock and a shot — but one
+ * read goes out before it, five seconds early and off the critical path: it
+ * asks whether yesterday is already booked, which is what makes a 200
+ * readable. When it cannot be answered, the fallback is to verify each 200's
+ * `history[].checkInDate` instead of trusting it.
  */
-async function postAtOpen(
+async function sprintCheckIn(
   account: Account,
   runDate: string,
+  slot: number,
   deadline: number,
 ): Promise<CheckInResult> {
   const api = apiFor(account);
-  const postedAt = Date.now();
-  try {
-    await api.postCheckIn();
-  } catch (e) {
-    if (e instanceof SessionExpiredError) return sessionExpiredCard(e, account);
-    const err = e as Error & { code?: string };
-    if (err.code === "RATE_LIMITED") return failedCard(err);
-    // The gate can lag the server's clock by a round trip; retry this one
-    // account on its own rather than losing the run.
-    return await runCheckIn(account, { runDate, retryUntil: deadline });
+  const targetMs = vnMidnightMs(runDate);
+  const shots = sprintShots(targetMs, Date.now(), slot);
+  /** Set once the grid is decided — a 200, a dead session, a rate limit. */
+  let settled = false;
+  let winPostedAt: number | undefined;
+  let fatal: CheckInResult | undefined;
+
+  // Resolves long before the first shot, and answers "may a 200 be read as the
+  // new day?". A dead session stands the grid down here; anything else says
+  // "no" and the 200s are verified instead.
+  const trusted = api.getCheckInStatus().then((s) => {
+    if (s.todayCheckedIn === true) return true;
+    console.log(`[sprint] ${account.username}: yesterday was never booked — wins must be verified`);
+    return false;
+  }).catch((e) => {
+    if (e instanceof SessionExpiredError) {
+      settled = true;
+      fatal = sessionExpiredCard(e, account);
+      console.log(`[sprint] ${account.username}: session gone (pre-race read)`);
+    } else {
+      console.error(`[sprint] ${account.username}: pre-race read failed, verifying every win:`, e);
+    }
+    return false;
+  });
+
+  const fire = async (k: number) => {
+    const delay = shots[k]! - Date.now();
+    if (delay > 0) await sleep(delay);
+    if (settled) return;
+    const postedAt = Date.now();
+    const mark = signed(postedAt - targetMs);
+    try {
+      await api.postCheckIn();
+      // 200 — but of *which* day? If yesterday was already booked, every shot
+      // before the flip must have been answered "already done", so this one can
+      // only have landed after it. Otherwise it may have booked yesterday.
+      if (winPostedAt === undefined) {
+        if (await trusted) {
+          winPostedAt = postedAt;
+          settled = true;
+          console.log(`[sprint] ${account.username} #${k + 1} ${mark}ms → OPEN`);
+        } else {
+          const s = await api.getCheckInStatus().catch(() => null);
+          const day = s ? lastCheckInDate(s) : undefined;
+          if (day !== undefined && day >= runDate) {
+            winPostedAt = postedAt;
+            settled = true;
+            console.log(`[sprint] ${account.username} #${k + 1} ${mark}ms → OPEN (verified)`);
+          } else {
+            console.log(`[sprint] ${account.username} #${k + 1} ${mark}ms → booked an earlier day`);
+          }
+        }
+      }
+    } catch (e) {
+      if (e instanceof SessionExpiredError) {
+        settled = true;
+        fatal = sessionExpiredCard(e, account);
+        console.log(`[sprint] ${account.username} #${k + 1} ${mark}ms → session gone`);
+        return;
+      }
+      const err = e as Error & { code?: string };
+      if (err.code === "RATE_LIMITED") {
+        settled = true;
+        fatal = failedCard(err);
+        console.log(`[sprint] ${account.username} #${k + 1} ${mark}ms → rate limited`);
+        return;
+      }
+      // "Hôm nay bạn đã điểm danh rồi" is what every shot before the flip must
+      // answer, and a transport blip is tolerated the same way: keep the grid.
+      // A 200 whose response was lost is settled by the fallback read.
+      const label = err.message.includes("điểm danh") ? "already" : (err.code ?? err.message);
+      console.log(`[sprint] ${account.username} #${k + 1} ${mark}ms → ${label}`);
+    }
+  };
+
+  await Promise.all(Array.from({ length: SPRINT_SHOTS }, (_, k) => fire(k)));
+
+  if (fatal) return fatal;
+  if (winPostedAt !== undefined) {
+    return await finishCheckIn(api, account, runDate, null, winPostedAt);
   }
-  return await finishCheckIn(api, account, runDate, null, postedAt);
+  // The grid never landed after the flip: the server's midnight is further from
+  // ours than it assumes. Read-and-post still works, just one round trip later.
+  console.log(`[sprint] ${account.username}: grid exhausted, reading instead`);
+  return await runCheckIn(account, { runDate, retryUntil: deadline });
 }
 
 /**
- * Check every account in as close to the same instant as possible.
+ * Check every account in around midnight, as close to the flip as possible.
  *
- * `runCheckIn` answers "what does this one account see" and polls on its own,
- * which is right for a manual `/checkin`. For the nightly race it is wasteful:
- * every account polls and then each lands on its own round trip. Here one
- * session watches for the flip and every POST is issued from a single
- * `Promise.all`, so the requests leave within microseconds of each other and
- * arrive within one round trip of each other.
+ * Before midnight that is one blind grid per account (see the block above),
+ * all anchored to the same instants. `runCheckIn` — read, decide, maybe post —
+ * stays the manual path and the fallback. Once the day is open (a catch-up
+ * run, a restart, a re-run) there is no race left to win, so each account
+ * answers on its own session and "already checked in" is honoured per login.
  */
 export async function runCheckInAll(
   targets: CheckInTarget[],
@@ -268,7 +323,7 @@ export async function runCheckInAll(
   const deadline = opts.retryUntil ?? 0;
   if (!targets.length) return [];
 
-  // A 401 costs two extra round trips, and they would land on the POST whose
+  // A 401 costs two extra round trips, and they would land on the shot whose
   // rank is being measured. Warm the tokens that are about to lapse while the
   // second is still worth nothing.
   await Promise.all(targets.map(async ({ account }) => {
@@ -279,30 +334,20 @@ export async function runCheckInAll(
     }
   }));
 
-  // The watcher is the first account that can still read the server. A dead
-  // session must not burn the window — hand the watch to the next one.
-  let gate: DayOpenMode | null = null;
-  for (const target of targets) {
-    try {
-      gate = await waitForDayOpen(apiFor(target.account), runDate, deadline);
-      break;
-    } catch (e) {
-      if (!(e instanceof SessionExpiredError)) throw e;
-    }
-  }
-
-  // The flip was observed: everyone POSTs at once, reads skipped.
-  if (gate === "race") {
+  // Midnight still ahead: the flip has not happened by definition, so there is
+  // nothing to read — fire the grid under it.
+  if (Date.now() < vnMidnightMs(runDate)) {
     return await Promise.all(
-      targets.map(async (target) => ({
-        ...target,
-        result: await postAtOpen(target.account, runDate, deadline),
+      targets.map(async ({ chatId, account }, slot) => ({
+        chatId,
+        account,
+        result: await sprintCheckIn(account, runDate, slot, deadline),
       })),
     );
   }
 
-  // Already open (catch-up, restart, a re-run) or we ran out of window: answer
-  // each account on its own session, so "already checked in" is respected.
+  // Already open (catch-up, restart, a re-run): answer each account on its own
+  // session, so "already checked in" is respected.
   return await Promise.all(
     targets.map(async (target) => ({
       ...target,
@@ -403,9 +448,19 @@ async function finishCheckIn(
 ): Promise<CheckInResult> {
   // Re-read status + balance to report the real outcome.
   const [after, wallet] = await Promise.all([
-    readConfirmedStatus(api, before),
+    readConfirmedStatus(api, before, runDate),
     api.getWallet().catch(() => null),
   ]);
+
+  // Booked, but not for the day that was raced: the POST landed while the
+  // server's "today" was still yesterday (which a missed night leaves open).
+  // Nothing is lost — the new day is simply still closed — but reporting a win
+  // here would mark `runDate` done and skip the night. Callers wait for the
+  // flip instead (and the catch-up cron is the net for a read that stays stale).
+  const bookedDay = after ? lastCheckInDate(after) : undefined;
+  if (bookedDay !== undefined && bookedDay < runDate) {
+    return dayNotOpenYet();
+  }
 
   account.lastCheckInDay = runDate;
   account.lastCheckInResult = "ok";
@@ -438,12 +493,15 @@ async function finishCheckIn(
  * `17:13:05.000Z` and the check-in row at `17:13:05.192Z`, so a status read
  * issued straight after the POST can still come back with the *previous*
  * streak — it answered 3 while the true value was 4. Rather than reporting a
- * number the server has not committed, confirm it: the flag must be set and the
- * streak must have moved past what we saw before the POST.
+ * number the server has not committed, confirm it: the day must be booked, the
+ * streak must have moved past what we saw before the POST, and the newest
+ * `history[].checkInDate` must be `runDate` — a pre-midnight POST books
+ * *yesterday* when a night was missed, and that is not this day's win.
  */
 async function readConfirmedStatus(
   api: CaffiApi,
   before: CheckInStatus | null,
+  runDate: string,
 ): Promise<CheckInStatus | null> {
   let last: CheckInStatus | null = null;
   let confirmed: CheckInStatus | null = null;
@@ -453,7 +511,13 @@ async function readConfirmedStatus(
       last = s;
       if (s.todayCheckedIn) {
         confirmed = s;
-        if ((s.currentStreak ?? 0) > (before?.currentStreak ?? -1)) return s;
+        const day = lastCheckInDate(s);
+        if (
+          (s.currentStreak ?? 0) > (before?.currentStreak ?? -1) &&
+          day !== undefined && day >= runDate
+        ) {
+          return s;
+        }
       }
     }
     if (i < 2) await sleep(250);
