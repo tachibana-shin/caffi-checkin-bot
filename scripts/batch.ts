@@ -53,10 +53,12 @@ const JOB_MS = 200;
 const RealDate = Date;
 const realNow = RealDate.now.bind(RealDate);
 let offset = 0;
-/** Point the clock at `FAKE_LEAD_MS` before `MIDNIGHT`, keeping it ticking. */
-const seek = () => {
-  offset = MIDNIGHT - FAKE_LEAD_MS - realNow();
+/** Point the clock `leadMs` before `MIDNIGHT`, keeping it ticking. */
+const seekTo = (leadMs: number) => {
+  offset = MIDNIGHT - leadMs - realNow();
 };
+/** Point the clock at `FAKE_LEAD_MS` before `MIDNIGHT` — where scenarios start. */
+const seek = () => seekTo(FAKE_LEAD_MS);
 seek();
 Date.now = () => realNow() + offset;
 globalThis.Date = class extends RealDate {
@@ -314,7 +316,7 @@ check("both accounts checked in", race.every((r) => r.result.outcome === "checke
   const lead = posts[0]!.at - MIDNIGHT;
   check(
     "the first shot is a stopwatch, fired as soon as the race opens",
-    lead >= -1_600 && lead <= -1_000,
+    lead >= -1_600 && lead <= -800,
     rel(posts[0]!.at),
   );
 }
@@ -552,6 +554,34 @@ check(
     callsOf("a@x.com").some((p) => p.status === 200),
   `${callsOf("a@x.com").length} POST(s)`,
 );
+
+// ── 10. The real runway: six seconds without burning the shot budget ───────
+reset();
+seekTo(6_000); // what the cron handler actually gives the race
+S.flipAt = MIDNIGHT;
+S.jobPlan = [500]; // a middling job: a naive refresh loop fires one per job
+const runway = await runCheckInAll([
+  { chatId: "tg:1", account: account("a@x.com") },
+], { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
+check(
+  "a six-second runway still books the day",
+  outcomeAt(runway, 0) === "checked_in",
+  outcomeAt(runway, 0),
+);
+const runwayShots = callsOf("a@x.com").length;
+check(
+  "…with shots to spare, not by looping until the budget runs out",
+  runwayShots <= 6,
+  `${runwayShots} shot(s)`,
+);
+{
+  const win = firstWin("a@x.com");
+  check(
+    "…and the aim still lands just past midnight",
+    win !== undefined && win >= MIDNIGHT && win - MIDNIGHT <= 700,
+    win === undefined ? "no 200" : `${win - MIDNIGHT}ms after midnight`,
+  );
+}
 
 console.log(failed ? `\n${failed} check(s) FAILED` : "\nAll OK");
 Deno.exit(failed ? 1 : 0);

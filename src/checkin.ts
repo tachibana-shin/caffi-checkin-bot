@@ -177,8 +177,10 @@ const RACE_START_MS = 6_000;
 const RACE_STOP_MS = 3_000;
 /** Aim a job's *completion* this far past midnight — covers the return leg. */
 const AIM_PAST_MS = 230;
-/** Re-measure whenever the aim is further away than this. */
+/** A stopwatch reading older than this is stale — re-measure before aiming. */
 const AIM_REFRESH_MS = 1_200;
+/** At most this many shots are spent purely re-timing the server. */
+const AIM_REFRESH_MAX = 3;
 /** A queue-full answer means our own job is still running; try again shortly. */
 const QUEUE_RETRY_MS = 150;
 /** Two accounts share one network path, not one queue — offset them a little. */
@@ -274,15 +276,36 @@ async function sprintCheckIn(
   await Promise.race([trusted, sleep(2_000)]);
 
   let measured = 0;
+  /** When the last `measured` reading came back — the server's load drifts. */
+  let measuredAt = 0;
+  /** Shots spent re-timing the server; the rest of the budget is for the aim. */
+  let refreshes = 0;
   while (!settled && fatal === undefined && Date.now() < stopAt && shots.length < MAX_SHOTS) {
     if (measured > 0) {
-      const wait = aimSendAt(targetMs, measured, skewMs, slotMs) - Date.now();
-      if (wait > AIM_REFRESH_MS) {
-        // The aim is still far away: send now, purely to time the server again.
-      } else if (wait > 0) {
-        await sleep(wait);
-        if (settled || fatal !== undefined) break;
+      const now = Date.now();
+      const aim = aimSendAt(targetMs, measured, skewMs, slotMs);
+      if (aim > now) {
+        // The send instant is still ahead. Wait for it — but wake early when
+        // the stopwatch is getting old, because a reading from another second
+        // is only a guess about a server whose load drifts. Only a few shots
+        // are spent that way: past that, waiting beats burning the budget.
+        const age = now - measuredAt;
+        // A refresh shot must not eat the aim itself: only spend one while
+        // there is room for another job's worth of time before the send
+        // instant. Past that, waiting beats re-timing.
+        const refreshDue = age >= AIM_REFRESH_MS && refreshes < AIM_REFRESH_MAX &&
+          aim - now > 2 * measured;
+        if (!refreshDue) {
+          const wait = age >= AIM_REFRESH_MS
+            ? aim - now
+            : Math.min(aim - now, AIM_REFRESH_MS - age);
+          await sleep(Math.max(1, wait));
+          if (settled || fatal !== undefined) break;
+          continue; // the aim is due now, or the reading is due a refresh
+        }
+        refreshes++;
       }
+      // The aim is already in the past (a late wake-up): fire at once.
     }
     const postedAt = Date.now();
     const mark = signed(postedAt - targetMs);
@@ -313,6 +336,7 @@ async function sprintCheckIn(
             );
           } else {
             measured = jobMs;
+            measuredAt = finishedAt;
             console.log(`[sprint] ${account.username} #${n} ${mark}ms → booked an earlier day`);
           }
         }
@@ -343,6 +367,7 @@ async function sprintCheckIn(
       // "Hôm nay bạn đã điểm danh rồi" is what every job before the flip must
       // answer, and a transport blip is tolerated the same way: keep aiming.
       measured = jobMs;
+      measuredAt = Date.now();
       const label = err.message.includes("điểm danh") ? "already" : (err.code ?? err.message);
       shots.push({ at: postedAt, ms: jobMs, label });
       console.log(`[sprint] ${account.username} #${n} ${mark}ms → ${label} (job ${jobMs}ms)`);
