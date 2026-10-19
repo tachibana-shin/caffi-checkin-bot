@@ -128,7 +128,10 @@ function tokenExpMs(token: string): number | undefined {
 }
 
 function errorFrom(r: RawResponse): CaffiError {
-  const code = r.body?.error?.code ??
+  // Some failures carry the code at the top level ("CHECK_IN_QUEUE_FULL") and
+  // some under `error`; both are handed to callers so a queue-full answer can
+  // be told apart from a real rate limit.
+  const code = r.body?.error?.code ?? r.body?.code ??
     (r.status === 401 ? "NOT_AUTHENTICATED" : `HTTP_${r.status}`);
   const message = r.body?.error?.message ?? r.body?.message ?? `Lỗi HTTP ${r.status}`;
   return new CaffiError(message, code, r.status);

@@ -5,7 +5,8 @@
  * giving up), (2) `decideFromStatus`, the rule that tells "the server has not
  * opened the new day yet" apart from "already checked in", (3) `pollDelay`,
  * the cadence that decides how fast a lost race notices the flip, and (4) the
- * geometry of the blind grid that actually wins the race (`sprintShots`).
+ * aim that makes a queued check-in job *finish* just after midnight
+ * (`aimSendAt`).
  * Vietnam is UTC+7 with no DST, so wall times below are exact.
  *
  *   deno task timing
@@ -15,7 +16,7 @@ Deno.env.set("BOT_SECRET", "timing-secret");
 Deno.env.set("DATA_DIR", "/tmp/opencode/caffi-timing");
 
 const { planRun } = await import("../src/scheduler.ts");
-const { checkedInAtOf, decideFromStatus, pollDelay, sprintShots, vnMidnightMs } = await import(
+const { checkedInAtOf, decideFromStatus, pollDelay, aimSendAt, vnMidnightMs } = await import(
   "../src/checkin.ts"
 );
 type ScheduleSettings = import("../src/scheduler.ts").ScheduleSettings;
@@ -196,37 +197,35 @@ function secondsLeft(plan: ReturnType<typeof planRun>, now: Date): number | null
   );
 }
 
-// ── The blind grid across midnight ───────────────────────────────────────
+// ── Aiming a job's finish across midnight ────────────────────────────────
 {
   const midnight = vnMidnightMs("2026-10-07");
-  // The pre-roll enters the grid about 4.5s before midnight.
-  const shots = sprintShots(midnight, midnight - 4_500, 0);
-  check("the grid is ten shots", shots.length === 10, String(shots.length));
+  // The server queues one check-in job per account and stamps `createdAt` when
+  // the job finishes, so the aim subtracts the measured round trip (how long
+  // the server is currently taking) from the finish instant we want.
   check(
-    "the first shot leaves 900ms before midnight",
-    shots[0] === midnight - 900,
-    `${shots[0]! - midnight}ms`,
+    "a 1s round trip leaves 770ms before midnight (finish ~230ms after)",
+    aimSendAt(midnight, 1_000, 0, 0) === midnight - 770,
+    `${aimSendAt(midnight, 1_000, 0, 0) - midnight}ms`,
   );
   check(
-    "the last shot lands 900ms after midnight — a server clock behind ours is still caught",
-    shots[shots.length - 1]! - midnight === 900,
-    `${shots[shots.length - 1]! - midnight}ms`,
+    "a 300ms round trip leaves 70ms before midnight",
+    aimSendAt(midnight, 300, 0, 0) === midnight + 30 - 100,
+    `${aimSendAt(midnight, 300, 0, 0) - midnight}ms`,
   );
   check(
-    "shots are 200ms apart",
-    shots.every((t, i) => i === 0 || t - shots[i - 1]! === 200),
+    "the second account is staggered",
+    aimSendAt(midnight, 800, 0, 100) - aimSendAt(midnight, 800, 0, 0) === 100,
   );
-  const second = sprintShots(midnight, midnight - 4_500, 1);
   check(
-    "the second account interleaves halfway between shots",
-    second[0] === midnight - 800,
-    `${second[0]! - midnight}ms`,
+    "a learned server-clock skew moves the whole aim",
+    aimSendAt(midnight, 800, -400, 0) === aimSendAt(midnight, 800, 0, 0) - 400,
   );
-  // A run that starts late anchors the grid at "now": it still crosses
-  // midnight, just with less runway.
-  const late = sprintShots(midnight, midnight - 100, 0);
-  check("a late start fires at once", late[0] === midnight - 100, `${late[0]! - midnight}ms`);
-  check("…and still crosses midnight", late.some((t) => t > midnight));
+  // A run that starts late: the caller fires at once because the aim is past.
+  check(
+    "late start — the computed send instant is already in the past",
+    aimSendAt(midnight, 500, 0, 0) < midnight - 100,
+  );
 }
 
 // ── Reporting the check-in time from the server's own record ─────────────

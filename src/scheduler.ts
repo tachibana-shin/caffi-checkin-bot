@@ -192,10 +192,10 @@ export interface RunReport {
   /** One line per account still standing between the day and being booked. */
   unfinished: string[];
   /**
-   * When each winning POST left, in ms relative to 00:00 (negative = sent
-   * before midnight, which the grid does on purpose). The number the
-   * leaderboard ranks passes through here on its way into `cron:runs`, so the
-   * grid geometry can be tuned from the traces alone.
+   * When each winning POST's *job* finished, in ms relative to 00:00 (negative
+   * = finished before midnight). The number the leaderboard ranks passes
+   * through here on its way into `cron:runs`, so the aim can be tuned from the
+   * traces alone.
    */
   posted?: Record<string, number>;
 }
@@ -335,10 +335,11 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<R
   );
 
   // The batch is the only run with something to win: before midnight every
-  // account fires a blind grid of POSTs across the flip, all anchored to the
-  // same instants, and the first shot to land after the server turns the day
-  // is the check-in. Waiting for a read to *show* the flip cost one round trip
-  // on a ~265ms connection — which was the whole race.
+  // account runs the motion above (see `sprintCheckIn`): one shot at a time,
+  // each round trip timing the server's queue, the next shot aimed so its job
+  // *finishes* just past the flip — the instant the leaderboard ranks. Waiting
+  // for a read to *show* the flip cost one round trip on a ~265ms connection —
+  // which was the whole race.
   const results = await runCheckInAll(targets, { runDate: date, retryUntil });
 
   const sends: Array<Promise<void>> = [];
@@ -353,12 +354,16 @@ async function runDaily(tg: Sender, date: string, retryUntil: number): Promise<R
       report.allDone = false;
       report.unfinished.push(`${account.username}: ${r.card.subtitle ?? r.outcome}`);
     }
-    // The whole pre-roll exists to land this POST as close to 00:00 as it can.
-    if (r.postedAt !== undefined) {
-      const delta = r.postedAt - midnight;
+    // The whole pre-roll exists to land this job's finish as close to 00:00 as
+    // it can — that is the instant the leaderboard ranks.
+    const at = r.finishedAt ?? r.postedAt;
+    if (at !== undefined) {
+      const delta = at - midnight;
       (report.posted ??= {})[account.username] = delta;
       console.log(
-        `[scheduler] ${account.username}: POST ${delta >= 0 ? "+" : ""}${delta}ms after 00:00`,
+        `[scheduler] ${account.username}: job finished ${
+          delta >= 0 ? "+" : ""
+        }${delta}ms after 00:00`,
       );
     }
 

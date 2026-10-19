@@ -1,27 +1,32 @@
 /**
- * Offline proof for the nightly batch: the blind grid across midnight.
+ * Offline proof for the nightly batch: aiming a queued check-in job at midnight.
  *
  * Stubs `fetch` against the Caffi base URL and makes the server behave like the
- * real one on the night that matters: before midnight a POST answers 400 "Hôm
- * nay bạn đã điểm danh rồi" (the previous day is still today, and it is done),
- * after midnight the first POST is the check-in (200) and any later one is a
- * duplicate. Records when each POST leaves — which is what the `earliest`
- * leaderboard ranks. Covers (1) the grid, with the flip landing between shots,
+ * real one does now that we know how it works: a POST is queued per account,
+ * only one job runs at a time, and the check-in row (its `createdAt`, which is
+ * what the `earliest` leaderboard ranks) is written when the job *finishes*.
+ * Before midnight the finished job answers 400 "Hôm nay bạn đã điểm danh rồi"
+ * (the previous day is still today, and it is done); the first job that finishes
+ * after the flip is the check-in, and any job started while one is running is
+ * answered 429 CHECK_IN_QUEUE_FULL. Records when each job *finished*.
+ *
+ * Covers (1) the stopwatch-and-aim race, with the flip landing between shots,
  * (2) a day that was already open (catch-up, restart, re-run), where each
  * account answers for itself and nothing is posted twice, (3) a dead session,
  * which must stand down without holding the other account back, (4) an expiring
- * token, refreshed before the grid instead of during it, (5) a flip beyond the
- * grid, which the read-and-post fallback must still book, (6) a rate limit,
- * which must stop that account's grid and leave the other alone, (7) a missed
- * yesterday, whose booking by a pre-midnight shot must not be mistaken for
- * tonight's win, and (8) a status that lies and says the booking is done —
- * the day must be reported unfinished rather than marked done on a 200 that
- * booked an earlier day.
+ * token, refreshed before the race instead of during it, (5) a flip beyond the
+ * aim, which the read-and-post fallback must still book, (6) a rate limit,
+ * which must stop that account's race and leave the other alone, (7) a missed
+ * yesterday, whose booking by a stopwatch shot must not be mistaken for
+ * tonight's win, (8) a status that lies and says the booking is done — the day
+ * must be reported unfinished rather than marked done on a 200 that booked an
+ * earlier day, and (9) a queue-full answer, which must be retried rather than
+ * treated as a failure.
  *
- * The grid waits for `midnight - 900ms`, and the harness does not: it moves the
+ * The race waits for `midnight - 6s`, and the harness does not: it moves the
  * clock instead — `Date.now()` reports "1.5 seconds before midnight" and keeps
- * ticking, while timers stay real. The stub reads the same clock, so a flip at
- * "+900ms" is +900ms of grid time, not of wall time.
+ * ticking, while timers stay real. The stub reads the same clock, so a job that
+ * takes 200ms takes 200ms of race time, not of wall time.
  *
  *   deno task batch
  */
@@ -34,16 +39,16 @@ Deno.env.set("DATA_DIR", "/tmp/opencode/caffi-batch");
 
 const { runCheckInAll, vnMidnightMs } = await import("../src/checkin.ts");
 
-/** The midnight the grid aims at. */
+/** The midnight the race aims at. */
 const RUN_DATE = "2030-01-01";
 const MIDNIGHT = vnMidnightMs(RUN_DATE);
 /** The day before it: the "today" the server still counts before the flip. */
 const OLD_DAY = "2029-12-31";
-/** Where the fake clock parks: close enough that the grid waits under a second. */
+/** Where the fake clock parks: close enough that the race runs at once. */
 const FAKE_LEAD_MS = 1_500;
-/** One status read and one POST each take this long on the wire. */
+/** One status read and one check-in job take this long on the wire. */
 const READ_MS = 265;
-const POST_MS = 200;
+const JOB_MS = 200;
 
 const RealDate = Date;
 const realNow = RealDate.now.bind(RealDate);
@@ -80,6 +85,16 @@ interface Stub {
   oldDayBooked: Set<string>;
   /** Accounts whose status claims the current day is booked when it is not. */
   staleTrue: Set<string>;
+  /** Accounts whose next POST is answered 429 CHECK_IN_QUEUE_FULL once. */
+  queueFullOnce: Set<string>;
+  /** Accounts with a check-in job running right now — the per-account queue. */
+  busy: Set<string>;
+  /** Job durations the server cycles through, ms. */
+  jobPlan: number[];
+  /** How many jobs have run, to index `jobPlan`. */
+  jobsRun: number;
+  /** Fake-clock ms of each account's last booked row — what `createdAt` says. */
+  bookedAt: Map<string, number>;
 }
 
 const S: Stub = {
@@ -91,6 +106,11 @@ const S: Stub = {
   oldDayMissed: new Set(),
   oldDayBooked: new Set(),
   staleTrue: new Set(),
+  queueFullOnce: new Set(),
+  busy: new Set(),
+  jobPlan: [JOB_MS],
+  jobsRun: 0,
+  bookedAt: new Map(),
 };
 
 interface Call {
@@ -101,7 +121,7 @@ interface Call {
 const posts: Call[] = [];
 const statusReads: Array<Omit<Call, "status">> = [];
 const refreshes: Array<{ token: string; at: number }> = [];
-/** Peak POSTs in flight — proves the grid pipelines but stays under Cloudflare's six. */
+/** Peak check-in jobs running at once — one per account, never more. */
 let maxInFlightPosts = 0;
 let inFlightPosts = 0;
 
@@ -149,7 +169,8 @@ const stub = async (input: unknown, init?: RequestInit): Promise<Response> => {
     // What the app sees. Before the server opens the day, "today" is still
     // yesterday: `todayCheckedIn` tells whether *yesterday* is booked, and
     // `staleTrue` models a status that lies about it.
-    const open = now >= S.flipAt;
+    const done = Date.now();
+    const open = done >= S.flipAt;
     const already = S.alreadyIn.has(user);
     const missed = S.oldDayMissed.has(user) && !S.oldDayBooked.has(user);
     const booked = open ? already : (!missed || S.staleTrue.has(user));
@@ -162,7 +183,7 @@ const stub = async (input: unknown, init?: RequestInit): Promise<Response> => {
           checkInDate: open && already
             ? S.runDate
             : (S.oldDayBooked.has(user) ? OLD_DAY : "1999-01-01"),
-          createdAt: new Date(now - 3_600_000).toISOString(),
+          createdAt: new Date(S.bookedAt.get(user) ?? 0).toISOString(),
         }],
       },
     });
@@ -170,34 +191,51 @@ const stub = async (input: unknown, init?: RequestInit): Promise<Response> => {
 
   if (path === "/api/v2/xeng/check-in" && method === "POST") {
     if (S.dead.has(user)) return json(401, { error: { code: "UNAUTHORIZED" } });
-    inFlightPosts++;
-    maxInFlightPosts = Math.max(maxInFlightPosts, inFlightPosts);
-    await rtt(POST_MS);
-    inFlightPosts--;
+    // The queue is per account and holds one job: anything posted while a job
+    // runs is turned away at once, exactly like the real server.
+    if (S.busy.has(user) || S.queueFullOnce.delete(user)) {
+      posts.push({ user, at: Date.now(), status: 429 });
+      return json(429, {
+        status: 429,
+        success: false,
+        code: "CHECK_IN_QUEUE_FULL",
+        message: "Điểm danh của bạn đang được xử lý. Vui lòng chờ một chút.",
+      });
+    }
     // The order matches the real server: limiter first, then the day check, so
     // a shot before the flip is a 400 and never looks like a rate problem.
     if (S.rateLimited.has(user)) {
-      posts.push({ user, at: now, status: 429 });
+      posts.push({ user, at: Date.now(), status: 429 });
       return json(429, { error: { code: "RATE_LIMITED", message: "Quá nhiều yêu cầu" } });
     }
-    const open = now >= S.flipAt;
-    if (!open) {
+    S.busy.add(user);
+    inFlightPosts++;
+    maxInFlightPosts = Math.max(maxInFlightPosts, inFlightPosts);
+    await rtt(S.jobPlan[S.jobsRun++ % S.jobPlan.length]!);
+    S.busy.delete(user);
+    inFlightPosts--;
+    // The row — and the `createdAt` the leaderboard ranks — is written when the
+    // job *finishes*, not when the POST arrived.
+    const done = Date.now();
+    if (done < S.flipAt) {
       // Still yesterday for the server: a duplicate unless yesterday was
-      // missed, in which case this POST books *it*.
+      // missed, in which case this job books *it*.
       if (S.oldDayMissed.has(user) && !S.oldDayBooked.has(user)) {
         S.oldDayBooked.add(user);
-        posts.push({ user, at: now, status: 200 });
+        S.bookedAt.set(user, done);
+        posts.push({ user, at: done, status: 200 });
         return json(200, { data: {} });
       }
-      posts.push({ user, at: now, status: 400 });
+      posts.push({ user, at: done, status: 400 });
       return json(400, { success: false, message: "Hôm nay bạn đã điểm danh rồi", status: 400 });
     }
     if (S.alreadyIn.has(user)) {
-      posts.push({ user, at: now, status: 400 });
+      posts.push({ user, at: done, status: 400 });
       return json(400, { success: false, message: "Hôm nay bạn đã điểm danh rồi", status: 400 });
     }
     S.alreadyIn.add(user);
-    posts.push({ user, at: now, status: 200 });
+    S.bookedAt.set(user, done);
+    posts.push({ user, at: done, status: 200 });
     return json(200, { data: {} });
   }
 
@@ -238,6 +276,11 @@ function reset() {
   S.oldDayMissed.clear();
   S.oldDayBooked.clear();
   S.staleTrue.clear();
+  S.queueFullOnce.clear();
+  S.busy.clear();
+  S.jobPlan = [JOB_MS];
+  S.jobsRun = 0;
+  S.bookedAt.clear();
 }
 
 let failed = 0;
@@ -256,9 +299,9 @@ const firstWin = (user: string) =>
 const callsOf = (user: string) => posts.filter((p) => p.user === user);
 const rel = (at: number) => `${at - MIDNIGHT >= 0 ? "+" : ""}${at - MIDNIGHT}ms`;
 
-// ── 1. The grid: the flip lands between shots ───────────────────────────────
+// ── 1. The race: the aim puts a job's finish just past midnight ─────────────
 reset();
-S.flipAt = Date.now() + 900; // the clock is 1.5s before midnight: the flip is at -600ms
+S.flipAt = MIDNIGHT; // the server's midnight is ours — no skew to learn
 const targets = [
   { chatId: "tg:1", account: account("a@x.com") },
   { chatId: "tg:1", account: account("main@x.com") },
@@ -270,26 +313,26 @@ check("both accounts checked in", race.every((r) => r.result.outcome === "checke
 {
   const lead = posts[0]!.at - MIDNIGHT;
   check(
-    "the first shot leaves 900ms before midnight",
-    lead >= -1000 && lead <= -700,
+    "the first shot is a stopwatch, fired as soon as the race opens",
+    lead >= -1_600 && lead <= -1_000,
     rel(posts[0]!.at),
   );
 }
 for (const user of ["a@x.com", "main@x.com"]) {
   const win = firstWin(user);
   check(
-    `${user}: the first shot after the flip is the check-in`,
-    win !== undefined && win >= S.flipAt && win - S.flipAt <= 700,
+    `${user}: the job aimed at midnight finishes just after it`,
+    win !== undefined && win >= S.flipAt && win - S.flipAt <= 400,
     win === undefined ? "no 200" : `+${win - S.flipAt}ms after the flip`,
   );
   check(
-    `${user}: shots before the flip are answered "already" and the grid keeps going`,
+    `${user}: jobs before the flip answer "already" and the race keeps aiming`,
     callsOf(user).some((p) => p.status === 400),
   );
   const last = Math.max(...callsOf(user).map((p) => p.at));
   check(
-    `${user}: the shots stand down once the day is booked`,
-    last <= (win ?? 0) + 900,
+    `${user}: the race stands down the moment the day is booked`,
+    last <= (win ?? 0) + 1,
     `${last - (win ?? 0)}ms after the win`,
   );
   const reads = statusReads.filter((r) => r.user === user);
@@ -306,11 +349,11 @@ for (const user of ["a@x.com", "main@x.com"]) {
   );
 }
 check(
-  "the grid pipelines, within Cloudflare's six connections",
-  maxInFlightPosts >= 2 && maxInFlightPosts <= 6,
-  `peak ${maxInFlightPosts} POSTs in flight`,
+  "one job per account at a time, the two accounts alongside each other",
+  maxInFlightPosts === 2,
+  `peak ${maxInFlightPosts} job(s) in flight`,
 );
-check("both grids together fire at most twenty shots", posts.length <= 20, `${posts.length} posts`);
+check("the race fires shots one by one, not a burst", posts.length <= 16, `${posts.length} posts`);
 
 // ── 2. Catch-up: the day was open before we looked ─────────────────────────
 reset();
@@ -321,7 +364,7 @@ const done = await runCheckInAll([
   { chatId: "tg:1", account: account("main@x.com") },
 ], { runDate: OLD_DAY, retryUntil: Date.now() + 60_000 });
 check(
-  "a run once the day is open does not fire the grid at all",
+  "a run once the day is open does not fire the race at all",
   callsOf("a@x.com").length === 0 && callsOf("main@x.com").length === 1,
   `${posts.length} POST(s)`,
 );
@@ -332,9 +375,9 @@ check(
 );
 check("the other one still checks in", outcomeAt(done, 1) === "checked_in");
 
-// ── 3. Dead session inside the grid ────────────────────────────────────────
+// ── 3. Dead session inside the race ────────────────────────────────────────
 reset();
-S.flipAt = Date.now() + 900;
+S.flipAt = MIDNIGHT;
 S.dead.add("a@x.com");
 const handed = await runCheckInAll([
   { chatId: "tg:1", account: account("a@x.com") },
@@ -360,9 +403,9 @@ check("the dead account never got a shot recorded", callsOf("a@x.com").length ==
   );
 }
 
-// ── 4. Expiring token: refreshed before the grid, not during it ────────────
+// ── 4. Expiring token: refreshed before the race, not during it ────────────
 reset();
-S.flipAt = Date.now() + 900;
+S.flipAt = MIDNIGHT;
 const stale = account("stale@x.com");
 // A JWT that expired yesterday: `warm` must replace it up front, so no shot
 // spends two extra round trips discovering that.
@@ -383,21 +426,21 @@ check("both accounts checked in", warmed.every((r) => r.result.outcome === "chec
 {
   const win = firstWin(fresh);
   check(
-    "the refresh did not push the account's grid out of the race",
+    "the refresh did not push the account's race out of the aim",
     win !== undefined && win - S.flipAt <= 700,
     win === undefined ? "no 200" : `+${win - S.flipAt}ms after the flip`,
   );
 }
 
-// ── 5. Flip beyond the grid: the fallback must still book the day ──────────
+// ── 5. Flip beyond the aim: the fallback must still book the day ───────────
 reset();
-S.flipAt = Date.now() + 3_600; // well past the grid's last shot at +1000ms
+S.flipAt = MIDNIGHT + 2_100; // well past the last aimed job's finish
 const late = await runCheckInAll([
   { chatId: "tg:1", account: account("a@x.com") },
   { chatId: "tg:1", account: account("main@x.com") },
 ], { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
 check(
-  "both accounts checked in after the grid came up empty",
+  "both accounts checked in after the race came up empty",
   late.every((r) => r.result.outcome === "checked_in"),
 );
 for (const user of ["a@x.com", "main@x.com"]) {
@@ -411,7 +454,7 @@ for (const user of ["a@x.com", "main@x.com"]) {
 
 // ── 6. Rate limit: that account stops, the other is untouched ──────────────
 reset();
-S.flipAt = Date.now() + 900;
+S.flipAt = MIDNIGHT;
 S.rateLimited.add("a@x.com");
 const limited = await runCheckInAll([
   { chatId: "tg:1", account: account("a@x.com") },
@@ -429,14 +472,14 @@ check(
   Math.max(...limitedPosts.map((p) => p.at)) - limitedPosts[0]!.at <= 700,
 );
 check(
-  "the other account's grid is unaffected",
+  "the other account's race is unaffected",
   outcomeAt(limited, 1) === "checked_in" && firstWin("main@x.com")! - S.flipAt <= 700,
   outcomeAt(limited, 1),
 );
 
 // ── 7. A missed yesterday: the first shot repairs it, tonight still wins ───
 reset();
-S.flipAt = Date.now() + 900;
+S.flipAt = MIDNIGHT;
 S.oldDayMissed.add("a@x.com"); // never checked in yesterday
 const repaired = await runCheckInAll([
   { chatId: "tg:1", account: account("a@x.com") },
@@ -467,7 +510,7 @@ check("the healthy account is untouched", outcomeAt(repaired, 1) === "checked_in
 
 // ── 8. A status that lies: a wrong-day 200 must not mark the day done ──────
 reset();
-S.flipAt = Date.now() + 900;
+S.flipAt = MIDNIGHT;
 S.oldDayMissed.add("a@x.com"); // the read would say "missed"…
 S.staleTrue.add("a@x.com"); // …but this status claims it is booked
 const liar = account("a@x.com");
@@ -486,8 +529,27 @@ check(
   String(liar.lastCheckInDay),
 );
 check(
-  "the grid stood down after the one 200 it trusted",
+  "the race stood down after the one 200 it trusted",
   callsOf("a@x.com").filter((p) => p.status === 200).length === 1,
+  `${callsOf("a@x.com").length} POST(s)`,
+);
+
+// ── 9. Queue full: a retry, never a failure ────────────────────────────────
+reset();
+S.flipAt = MIDNIGHT;
+S.queueFullOnce.add("a@x.com"); // a job from an earlier invocation is still alive
+const queued = await runCheckInAll([
+  { chatId: "tg:1", account: account("a@x.com") },
+], { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
+check(
+  "a queue-full answer does not fail the account",
+  outcomeAt(queued, 0) === "checked_in",
+  outcomeAt(queued, 0),
+);
+check(
+  "…and the race retries straight after it",
+  callsOf("a@x.com").some((p) => p.status === 429) &&
+    callsOf("a@x.com").some((p) => p.status === 200),
   `${callsOf("a@x.com").length} POST(s)`,
 );
 

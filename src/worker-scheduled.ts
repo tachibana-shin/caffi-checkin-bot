@@ -14,14 +14,15 @@
  * ~28s (17:28:00 fired at 17:28:30), cron-job.org by up to 64s (00:00:00
  * fired at 00:01:04, which is the two days the check-in went out at 00:01).
  * Firing three minutes early makes all of that free: the handler warms the
- * connections, sleeps until the window opens, and only then fires the blind
- * grid across midnight — shots start 900ms before 00:00 and land every 200ms.
+ * connections, sleeps until the window opens, and only then runs the race
+ * against the server's queued check-in job (see `checkin.ts`).
  * A cron invocation may run 15 minutes of wall time for 10ms of CPU, and
  * sleeping costs none of it.
  *
  * Placement only holds for fetch handlers, so this path is unplaced. That no
- * longer decides the race — what bounds the grid is its own spacing, not the
- * round trip to Caffi — it only makes the confirm reads after the win slower.
+ * longer decides the race — the race is decided by the aim in the placed fetch
+ * handler this cron wakes — it only makes the confirm reads after the win
+ * slower.
  */
 import { apiFor, sleep } from "./checkin.ts";
 import { boot } from "./boot.ts";
