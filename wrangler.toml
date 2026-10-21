@@ -8,8 +8,9 @@ compatibility_date = "2026-10-01"
 # Vietnam, which is larger than the whole midnight race. Placed, the isolate
 # runs in the colo closest to the Caffi servers.
 #
-# Placement only applies to *fetch* handlers, so the cron handler does not call
-# the API itself: it wakes `/race` over HTTP and the work happens there.
+# Placement only applies to *fetch* handlers, so the cron handler runs unplaced
+# and races from there; `/race` (an external scheduler such as cron-job.com) is
+# the placed path, and the shorter round trip makes its knock loop tighter.
 [placement]
 hostname = "client-api.caffiliate.vn"
 

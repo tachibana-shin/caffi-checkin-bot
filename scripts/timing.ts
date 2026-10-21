@@ -3,10 +3,8 @@
  *
  * Covers (1) the window arithmetic in `planRun` (wake-up boundary, catch-up,
  * giving up), (2) `decideFromStatus`, the rule that tells "the server has not
- * opened the new day yet" apart from "already checked in", (3) `pollDelay`,
- * the cadence that decides how fast a lost race notices the flip, and (4) the
- * aim that makes a queued check-in job *finish* just after midnight
- * (`aimSendAt`).
+ * opened the new day yet" apart from "already checked in", and (3) `pollDelay`,
+ * the cadence that decides how fast a lost race notices the flip.
  * Vietnam is UTC+7 with no DST, so wall times below are exact.
  *
  *   deno task timing
@@ -16,7 +14,7 @@ Deno.env.set("BOT_SECRET", "timing-secret");
 Deno.env.set("DATA_DIR", "/tmp/opencode/caffi-timing");
 
 const { planRun } = await import("../src/scheduler.ts");
-const { checkedInAtOf, decideFromStatus, pollDelay, aimSendAt, vnMidnightMs } = await import(
+const { checkedInAtOf, decideFromStatus, pollDelay, vnMidnightMs } = await import(
   "../src/checkin.ts"
 );
 type ScheduleSettings = import("../src/scheduler.ts").ScheduleSettings;
@@ -194,37 +192,6 @@ function secondsLeft(plan: ReturnType<typeof planRun>, now: Date): number | null
     "late start — never polls at 50ms",
     pollDelay(target, lateStart + 500, lateStart) === 1_000,
     String(pollDelay(target, lateStart + 500, lateStart)),
-  );
-}
-
-// ── Aiming a job's finish across midnight ────────────────────────────────
-{
-  const midnight = vnMidnightMs("2026-10-07");
-  // The server queues one check-in job per account and stamps `createdAt` when
-  // the job finishes, so the aim subtracts the measured round trip (how long
-  // the server is currently taking) from the finish instant we want.
-  check(
-    "a 1s round trip leaves 770ms before midnight (finish ~230ms after)",
-    aimSendAt(midnight, 1_000, 0, 0) === midnight - 770,
-    `${aimSendAt(midnight, 1_000, 0, 0) - midnight}ms`,
-  );
-  check(
-    "a 300ms round trip leaves 70ms before midnight",
-    aimSendAt(midnight, 300, 0, 0) === midnight + 30 - 100,
-    `${aimSendAt(midnight, 300, 0, 0) - midnight}ms`,
-  );
-  check(
-    "the second account is staggered",
-    aimSendAt(midnight, 800, 0, 100) - aimSendAt(midnight, 800, 0, 0) === 100,
-  );
-  check(
-    "a learned server-clock skew moves the whole aim",
-    aimSendAt(midnight, 800, -400, 0) === aimSendAt(midnight, 800, 0, 0) - 400,
-  );
-  // A run that starts late: the caller fires at once because the aim is past.
-  check(
-    "late start — the computed send instant is already in the past",
-    aimSendAt(midnight, 500, 0, 0) < midnight - 100,
   );
 }
 

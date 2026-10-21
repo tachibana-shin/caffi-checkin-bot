@@ -8,9 +8,13 @@
  * The split matters because of **placement**: Smart Placement holds the isolate
  * in the Cloudflare colo closest to the Caffi servers in Vietnam, but it only
  * applies to `fetch` handlers. The Caffi API is a single VNPT address, so
- * Cloudflare can triangulate it — and ~265ms of round trip was the difference
- * between rank 3 and rank 10. So the cron handler never touches the API itself:
- * it wakes `/race` over HTTP and the race happens inside a placed fetch.
+ * Cloudflare can triangulate it — and the race is a knock loop, one POST per
+ * round trip, so the placement's shorter round trip buys a tighter race.
+ *
+ * A Worker cannot subrequest itself (`workers.dev` answers 404, a custom domain
+ * 522), so the cron handler does not "wake `/race`": it runs the race right
+ * there, unplaced. `/race` is the placed path for an external scheduler that
+ * can hit it (cron-job.com).
  *
  * The dynamic imports are deliberate. workerd has no `Deno.env`, so the config
  * has to be pointed at the `env` binding *before* any module reads it, and a

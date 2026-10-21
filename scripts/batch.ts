@@ -1,32 +1,33 @@
 /**
- * Offline proof for the nightly batch: aiming a queued check-in job at midnight.
+ * Offline proof for the nightly batch: knocking a check-in onto the flip.
  *
  * Stubs `fetch` against the Caffi base URL and makes the server behave like the
- * real one does now that we know how it works: a POST is queued per account,
- * only one job runs at a time, and the check-in row (its `createdAt`, which is
- * what the `earliest` leaderboard ranks) is written when the job *finishes*.
- * Before midnight the finished job answers 400 "Hôm nay bạn đã điểm danh rồi"
- * (the previous day is still today, and it is done); the first job that finishes
- * after the flip is the check-in, and any job started while one is running is
- * answered 429 CHECK_IN_QUEUE_FULL. Records when each job *finished*.
+ * real one does now that we know how it works. A POST that arrives before the
+ * day opens is turned away in one round trip and never enters the queue. The
+ * first POST that arrives after the flip starts a per-account job, any POST
+ * while it runs answers 429 CHECK_IN_QUEUE_FULL, and the check-in row — its
+ * `createdAt` is what the `earliest` leaderboard ranks — is written when the
+ * job *finishes*. The one pre-flip POST that is a real job is a repair of a
+ * missed yesterday.
  *
- * Covers (1) the stopwatch-and-aim race, with the flip landing between shots,
- * (2) a day that was already open (catch-up, restart, re-run), where each
- * account answers for itself and nothing is posted twice, (3) a dead session,
- * which must stand down without holding the other account back, (4) an expiring
- * token, refreshed before the race instead of during it, (5) a flip beyond the
- * aim, which the read-and-post fallback must still book, (6) a rate limit,
- * which must stop that account's race and leave the other alone, (7) a missed
- * yesterday, whose booking by a stopwatch shot must not be mistaken for
- * tonight's win, (8) a status that lies and says the booking is done — the day
- * must be reported unfinished rather than marked done on a 200 that booked an
- * earlier day, and (9) a queue-full answer, which must be retried rather than
- * treated as a failure.
+ * Covers (1) the knock race, which must put the accepted POST within one round
+ * trip of the flip, (2) a day that was already open (catch-up, restart, re-run),
+ * where each account answers for itself and nothing is posted twice, (3) a dead
+ * session, which must stand down without holding the other account back, (4) an
+ * expiring token, refreshed before the race instead of during it, (5) a flip
+ * beyond the knock window, which the read-and-post fallback must still book,
+ * (6) a rate limit, which must stop that account's race and leave the other
+ * alone, (7) a missed yesterday, whose booking by a pre-flip knock must not be
+ * mistaken for tonight's win, (8) a status that lies and says the booking is
+ * done — the day must be reported unfinished rather than marked done on a 200
+ * that booked an earlier day, (9) a queue-full answer, which must be retried
+ * rather than treated as a failure, and (10) a lost response, after which the
+ * next knock is a slow duplicate that must be read as "already booked".
  *
- * The race waits for `midnight - 6s`, and the harness does not: it moves the
- * clock instead — `Date.now()` reports "1.5 seconds before midnight" and keeps
- * ticking, while timers stay real. The stub reads the same clock, so a job that
- * takes 200ms takes 200ms of race time, not of wall time.
+ * The race naps until 600ms before midnight, and the harness does not: it moves
+ * the clock instead — `Date.now()` reports "1.5 seconds before midnight" and
+ * keeps ticking, while timers stay real. The stub reads the same clock, so a
+ * job that takes 500ms takes 500ms of race time, not of wall time.
  *
  *   deno task batch
  */
@@ -37,7 +38,7 @@ Deno.env.set("BOT_SECRET", "batch-secret");
 Deno.env.set("RUNTIME_MODE", "polling");
 Deno.env.set("DATA_DIR", "/tmp/opencode/caffi-batch");
 
-const { runCheckInAll, vnMidnightMs } = await import("../src/checkin.ts");
+const { runCheckInAll, vnMidnightMs, KNOCK_LEAD_MS } = await import("../src/checkin.ts");
 
 /** The midnight the race aims at. */
 const RUN_DATE = "2030-01-01";
@@ -46,27 +47,70 @@ const MIDNIGHT = vnMidnightMs(RUN_DATE);
 const OLD_DAY = "2029-12-31";
 /** Where the fake clock parks: close enough that the race runs at once. */
 const FAKE_LEAD_MS = 1_500;
-/** One status read and one check-in job take this long on the wire. */
+/** One status read takes this long on the wire. */
 const READ_MS = 265;
-const JOB_MS = 200;
+/** One turned-away knock: the round trip, no job. */
+const KNOCK_MS = 65;
+/** The accepted check-in job, from arrival to the row being written. */
+const JOB_MS = 500;
 
 const RealDate = Date;
-const realNow = RealDate.now.bind(RealDate);
-let offset = 0;
-/** Point the clock `leadMs` before `MIDNIGHT`, keeping it ticking. */
+/**
+ * The fake clock, driven by a virtual timer queue.
+ *
+ * `Date.now()` is the fake time, and `setTimeout` does not wait — it parks the
+ * callback in a queue and the pump advances the fake clock to its deadline. So
+ * a 500ms job still takes 500ms of race time, but no wall time, and the timing
+ * assertions do not depend on how loaded the machine is. Callbacks are handed
+ * back on a real macrotask so the promises they resolve can interleave.
+ */
+let now = 0;
+let pumping = false;
+let seq = 0;
+interface Timer {
+  at: number;
+  seq: number;
+  fn: () => void;
+}
+const timers: Timer[] = [];
+const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+
+function schedule(): void {
+  if (pumping || !timers.length) return;
+  pumping = true;
+  realSetTimeout(pump, 0);
+}
+
+function pump(): void {
+  pumping = false;
+  timers.sort((a, b) => a.at - b.at || a.seq - b.seq);
+  const t = timers.shift();
+  if (!t) return;
+  if (t.at > now) now = t.at;
+  t.fn();
+  schedule();
+}
+
+globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+  timers.push({ at: now + (ms ?? 0), seq: seq++, fn });
+  schedule();
+  return 0;
+}) as unknown as typeof setTimeout;
+
+/** Point the clock `leadMs` before `MIDNIGHT`. */
 const seekTo = (leadMs: number) => {
-  offset = MIDNIGHT - leadMs - realNow();
+  now = MIDNIGHT - leadMs;
 };
 /** Point the clock at `FAKE_LEAD_MS` before `MIDNIGHT` — where scenarios start. */
 const seek = () => seekTo(FAKE_LEAD_MS);
 seek();
-Date.now = () => realNow() + offset;
+Date.now = () => now;
 globalThis.Date = class extends RealDate {
   constructor(...args: unknown[]) {
-    super(...((args.length === 0 ? [realNow() + offset] : args) as [number]));
+    super(...((args.length === 0 ? [now] : args) as [number]));
   }
   static override now() {
-    return realNow() + offset;
+    return now;
   }
 } as unknown as DateConstructor;
 
@@ -89,6 +133,8 @@ interface Stub {
   staleTrue: Set<string>;
   /** Accounts whose next POST is answered 429 CHECK_IN_QUEUE_FULL once. */
   queueFullOnce: Set<string>;
+  /** Accounts whose next *accepted* POST has its response lost on the way back. */
+  lostOnce: Set<string>;
   /** Accounts with a check-in job running right now — the per-account queue. */
   busy: Set<string>;
   /** Job durations the server cycles through, ms. */
@@ -109,6 +155,7 @@ const S: Stub = {
   oldDayBooked: new Set(),
   staleTrue: new Set(),
   queueFullOnce: new Set(),
+  lostOnce: new Set(),
   busy: new Set(),
   jobPlan: [JOB_MS],
   jobsRun: 0,
@@ -117,11 +164,16 @@ const S: Stub = {
 
 interface Call {
   user: string;
+  /** Fake-clock ms at which the POST arrived — what the knock cadence sees. */
   at: number;
+  /** Fake-clock ms at which the server answered (the row instant for a 200). */
+  done: number;
   status: number;
+  /** For a 200: the day the written row belongs to. */
+  day?: string;
 }
 const posts: Call[] = [];
-const statusReads: Array<Omit<Call, "status">> = [];
+const statusReads: Array<{ user: string; at: number }> = [];
 const refreshes: Array<{ token: string; at: number }> = [];
 /** Peak check-in jobs running at once — one per account, never more. */
 let maxInFlightPosts = 0;
@@ -192,11 +244,12 @@ const stub = async (input: unknown, init?: RequestInit): Promise<Response> => {
   }
 
   if (path === "/api/v2/xeng/check-in" && method === "POST") {
+    const arrivedAt = Date.now();
     if (S.dead.has(user)) return json(401, { error: { code: "UNAUTHORIZED" } });
     // The queue is per account and holds one job: anything posted while a job
     // runs is turned away at once, exactly like the real server.
     if (S.busy.has(user) || S.queueFullOnce.delete(user)) {
-      posts.push({ user, at: Date.now(), status: 429 });
+      posts.push({ user, at: arrivedAt, done: Date.now(), status: 429 });
       return json(429, {
         status: 429,
         success: false,
@@ -205,39 +258,49 @@ const stub = async (input: unknown, init?: RequestInit): Promise<Response> => {
       });
     }
     // The order matches the real server: limiter first, then the day check, so
-    // a shot before the flip is a 400 and never looks like a rate problem.
+    // a knock before the flip is a 400 and never looks like a rate problem.
     if (S.rateLimited.has(user)) {
-      posts.push({ user, at: Date.now(), status: 429 });
+      posts.push({ user, at: arrivedAt, done: Date.now(), status: 429 });
       return json(429, { error: { code: "RATE_LIMITED", message: "Quá nhiều yêu cầu" } });
     }
+    // The day check happens when the POST *arrives*: before the flip, the
+    // request is turned away in one round trip and never enters the queue.
+    // The single exception is a yesterday that was missed — that is a real
+    // job, and it books yesterday.
+    const open = arrivedAt >= S.flipAt;
+    const repairing = !open && S.oldDayMissed.has(user) && !S.oldDayBooked.has(user);
+    if (!open && !repairing) {
+      await rtt(KNOCK_MS);
+      posts.push({ user, at: arrivedAt, done: Date.now(), status: 400 });
+      return json(400, { success: false, message: "Hôm nay bạn đã điểm danh rồi", status: 400 });
+    }
+    // Accepted: one job per account, and the row — with the `createdAt` the
+    // leaderboard ranks — is written when the job *finishes*.
+    const lost = S.lostOnce.delete(user);
     S.busy.add(user);
     inFlightPosts++;
     maxInFlightPosts = Math.max(maxInFlightPosts, inFlightPosts);
     await rtt(S.jobPlan[S.jobsRun++ % S.jobPlan.length]!);
     S.busy.delete(user);
     inFlightPosts--;
-    // The row — and the `createdAt` the leaderboard ranks — is written when the
-    // job *finishes*, not when the POST arrived.
     const done = Date.now();
-    if (done < S.flipAt) {
-      // Still yesterday for the server: a duplicate unless yesterday was
-      // missed, in which case this job books *it*.
-      if (S.oldDayMissed.has(user) && !S.oldDayBooked.has(user)) {
-        S.oldDayBooked.add(user);
-        S.bookedAt.set(user, done);
-        posts.push({ user, at: done, status: 200 });
-        return json(200, { data: {} });
-      }
-      posts.push({ user, at: done, status: 400 });
-      return json(400, { success: false, message: "Hôm nay bạn đã điểm danh rồi", status: 400 });
+    if (repairing) {
+      S.oldDayBooked.add(user);
+      S.bookedAt.set(user, done);
+      posts.push({ user, at: arrivedAt, done, status: 200, day: OLD_DAY });
+      return json(200, { data: {} });
     }
     if (S.alreadyIn.has(user)) {
-      posts.push({ user, at: done, status: 400 });
+      posts.push({ user, at: arrivedAt, done, status: 400 });
       return json(400, { success: false, message: "Hôm nay bạn đã điểm danh rồi", status: 400 });
     }
     S.alreadyIn.add(user);
     S.bookedAt.set(user, done);
-    posts.push({ user, at: done, status: 200 });
+    posts.push({ user, at: arrivedAt, done, status: 200, day: S.runDate });
+    // The job ran and the row is written, but the answer never makes it back:
+    // from our side this looks like a transport blip, and the next knock will
+    // be answered as a duplicate.
+    if (lost) throw new TypeError("connection reset by peer");
     return json(200, { data: {} });
   }
 
@@ -279,6 +342,7 @@ function reset() {
   S.oldDayBooked.clear();
   S.staleTrue.clear();
   S.queueFullOnce.clear();
+  S.lostOnce.clear();
   S.busy.clear();
   S.jobPlan = [JOB_MS];
   S.jobsRun = 0;
@@ -293,17 +357,20 @@ function check(name: string, ok: boolean, extra = "") {
 
 type BatchRun = Array<{ chatId: string; result: import("../src/checkin.ts").CheckInResult }>;
 const outcomeAt = (run: BatchRun, i: number) => run[i]?.result.outcome;
-/** When the check-in landed for a user: the first 200, in fake-clock ms. */
+/** The first row this user's race wrote — a 200's `createdAt`, in fake-clock ms. */
 const firstWin = (user: string) =>
-  posts.filter((p) => p.user === user && p.status === 200).map((p) => p.at).sort((a, b) =>
+  posts.filter((p) => p.user === user && p.status === 200).map((p) => p.done).sort((a, b) =>
     a - b
   )[0];
+/** The POST that opened the day (arrival), judged against the flip. */
+const openingPost = (user: string) =>
+  posts.find((p) => p.user === user && p.status === 200 && p.done >= S.flipAt);
 const callsOf = (user: string) => posts.filter((p) => p.user === user);
 const rel = (at: number) => `${at - MIDNIGHT >= 0 ? "+" : ""}${at - MIDNIGHT}ms`;
 
-// ── 1. The race: the aim puts a job's finish just past midnight ─────────────
+// ── 1. The race: knock until the server's flip, then let the job run ──────
 reset();
-S.flipAt = MIDNIGHT; // the server's midnight is ours — no skew to learn
+S.flipAt = MIDNIGHT; // the server's midnight is ours
 const targets = [
   { chatId: "tg:1", account: account("a@x.com") },
   { chatId: "tg:1", account: account("main@x.com") },
@@ -312,41 +379,52 @@ const targets = [
 const race = await runCheckInAll(targets, { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
 
 check("both accounts checked in", race.every((r) => r.result.outcome === "checked_in"));
-{
-  const lead = posts[0]!.at - MIDNIGHT;
-  check(
-    "the first shot is a stopwatch, fired as soon as the race opens",
-    lead >= -1_600 && lead <= -800,
-    rel(posts[0]!.at),
-  );
-}
 for (const user of ["a@x.com", "main@x.com"]) {
-  const win = firstWin(user);
+  const calls = callsOf(user);
+  const win = openingPost(user);
   check(
-    `${user}: the job aimed at midnight finishes just after it`,
-    win !== undefined && win >= S.flipAt && win - S.flipAt <= 400,
-    win === undefined ? "no 200" : `+${win - S.flipAt}ms after the flip`,
+    `${user}: the first knock leaves at the start of the lead window`,
+    calls[0] !== undefined &&
+      calls[0].at - MIDNIGHT >= -KNOCK_LEAD_MS - 20 &&
+      calls[0].at - MIDNIGHT <= -KNOCK_LEAD_MS + 120,
+    calls[0] === undefined ? "no POST" : rel(calls[0].at),
   );
   check(
-    `${user}: jobs before the flip answer "already" and the race keeps aiming`,
-    callsOf(user).some((p) => p.status === 400),
+    `${user}: the accepted POST is the first one after the flip`,
+    win !== undefined && win.at >= S.flipAt && win.at - S.flipAt <= 2 * KNOCK_MS,
+    win === undefined ? "no 200" : `sent ${rel(win.at)}`,
   );
-  const last = Math.max(...callsOf(user).map((p) => p.at));
+  check(
+    `${user}: …so the row is only the job's own duration late`,
+    win !== undefined && win.done - S.flipAt <= JOB_MS + 2 * KNOCK_MS,
+    win === undefined ? "no 200" : `row ${rel(win.done)} (${win.done - win.at}ms job)`,
+  );
+  const knocks = calls.filter((p) => p.status === 400);
+  check(
+    `${user}: knocks before the flip are turned away in one round trip`,
+    knocks.length > 0 && knocks.every((p) => p.done - p.at <= KNOCK_MS + 10),
+    `${knocks.length} knock(s)`,
+  );
+  check(
+    `${user}: one knock at a time, a round trip apart — never a burst`,
+    calls.every((p, i) => i === 0 || p.at - calls[i - 1]!.at >= KNOCK_MS - 10),
+    `${calls.length} POST(s)`,
+  );
+  const last = Math.max(...calls.map((p) => p.at));
   check(
     `${user}: the race stands down the moment the day is booked`,
-    last <= (win ?? 0) + 1,
-    `${last - (win ?? 0)}ms after the win`,
+    win !== undefined && last <= win.done,
+    `${last - (win?.done ?? 0)}ms after the row`,
   );
   const reads = statusReads.filter((r) => r.user === user);
-  const firstShot = Math.min(...callsOf(user).map((p) => p.at));
   check(
-    `${user}: only the pre-race read happens before the shots`,
-    reads.filter((r) => r.at < firstShot).length === 1,
-    `${reads.filter((r) => r.at < firstShot).length} read(s)`,
+    `${user}: both warm-up reads happen before the first knock`,
+    reads.filter((r) => r.at < calls[0]!.at).length === 2,
+    `${reads.filter((r) => r.at < calls[0]!.at).length} read(s)`,
   );
   check(
-    `${user}: nothing reads the status between the first shot and the win`,
-    reads.every((r) => r.at < firstShot || r.at >= (win ?? 0)),
+    `${user}: nothing reads the status between the first knock and the win`,
+    reads.every((r) => r.at < calls[0]!.at || r.at >= (win?.done ?? 0)),
     `${reads.length} read(s)`,
   );
 }
@@ -355,7 +433,11 @@ check(
   maxInFlightPosts === 2,
   `peak ${maxInFlightPosts} job(s) in flight`,
 );
-check("the race fires shots one by one, not a burst", posts.length <= 16, `${posts.length} posts`);
+check(
+  "the race fires one knock per round trip, not a blind grid",
+  posts.length <= 2 * Math.ceil(KNOCK_LEAD_MS / KNOCK_MS) + 4,
+  `${posts.length} posts`,
+);
 
 // ── 2. Catch-up: the day was open before we looked ─────────────────────────
 reset();
@@ -434,22 +516,22 @@ check("both accounts checked in", warmed.every((r) => r.result.outcome === "chec
   );
 }
 
-// ── 5. Flip beyond the aim: the fallback must still book the day ───────────
+// ── 5. Flip beyond the knock window: the fallback must still book the day ──
 reset();
-S.flipAt = MIDNIGHT + 2_100; // well past the last aimed job's finish
+S.flipAt = MIDNIGHT + 3_200; // past RACE_STOP_MS: every knock is still early
 const late = await runCheckInAll([
   { chatId: "tg:1", account: account("a@x.com") },
   { chatId: "tg:1", account: account("main@x.com") },
 ], { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
 check(
-  "both accounts checked in after the race came up empty",
+  "both accounts checked in after the knock window came up empty",
   late.every((r) => r.result.outcome === "checked_in"),
 );
 for (const user of ["a@x.com", "main@x.com"]) {
   const win = firstWin(user);
   check(
     `${user}: the fallback caught the late flip`,
-    win !== undefined && win >= S.flipAt && win - S.flipAt <= 2_000,
+    win !== undefined && win >= S.flipAt && win - S.flipAt <= 3_000,
     win === undefined ? "no 200" : `+${win - S.flipAt}ms after the flip`,
   );
 }
@@ -488,19 +570,18 @@ const repaired = await runCheckInAll([
   { chatId: "tg:1", account: account("main@x.com") },
 ], { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
 {
-  const wins = posts.filter((p) => p.user === "a@x.com" && p.status === 200)
-    .map((p) => p.at)
-    .sort((a, b) => a - b);
+  const rows = posts.filter((p) => p.user === "a@x.com" && p.status === 200);
+  const repair = rows.find((p) => p.day === OLD_DAY);
   check(
-    "the missed day is repaired by a pre-midnight shot",
-    wins.length > 0 && wins[0]! < S.flipAt,
-    `${wins.length} 200(s), first ${rel(wins[0] ?? 0)}`,
+    "the missed day is repaired by a pre-flip knock",
+    repair !== undefined && repair.at < S.flipAt,
+    repair === undefined ? "never repaired" : `sent ${rel(repair.at)}, row ${rel(repair.done)}`,
   );
-  const tonight = wins.find((at) => at >= S.flipAt);
+  const tonight = rows.find((p) => p.day === S.runDate);
   check(
-    "…and tonight's win is the first 200 after the flip, not the repair",
-    tonight !== undefined && tonight - S.flipAt <= 700,
-    tonight === undefined ? "never booked tonight" : `+${tonight - S.flipAt}ms after the flip`,
+    "…and tonight's win is its own row, not the repair",
+    tonight !== undefined && tonight.done - S.flipAt <= JOB_MS + READ_MS + 2 * KNOCK_MS + 250,
+    tonight === undefined ? "never booked tonight" : `row ${rel(tonight.done)}`,
   );
 }
 check(
@@ -555,11 +636,10 @@ check(
   `${callsOf("a@x.com").length} POST(s)`,
 );
 
-// ── 10. The real runway: six seconds without burning the shot budget ───────
+// ── 10. The real runway: six seconds without burning a single knock ────────
 reset();
 seekTo(6_000); // what the cron handler actually gives the race
 S.flipAt = MIDNIGHT;
-S.jobPlan = [500]; // a middling job: a naive refresh loop fires one per job
 const runway = await runCheckInAll([
   { chatId: "tg:1", account: account("a@x.com") },
 ], { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
@@ -568,18 +648,46 @@ check(
   outcomeAt(runway, 0) === "checked_in",
   outcomeAt(runway, 0),
 );
-const runwayShots = callsOf("a@x.com").length;
+const runwayCalls = callsOf("a@x.com");
 check(
-  "…with shots to spare, not by looping until the budget runs out",
-  runwayShots <= 6,
-  `${runwayShots} shot(s)`,
+  "…without knocking during the runway",
+  runwayCalls[0] !== undefined && runwayCalls[0].at >= MIDNIGHT - KNOCK_LEAD_MS - 20,
+  runwayCalls[0] === undefined ? "no POST" : rel(runwayCalls[0].at),
+);
+check(
+  "…and with knocks to spare, not by looping until the budget runs out",
+  runwayCalls.length <= Math.ceil(KNOCK_LEAD_MS / KNOCK_MS) + 4,
+  `${runwayCalls.length} POST(s)`,
 );
 {
-  const win = firstWin("a@x.com");
+  const win = openingPost("a@x.com");
   check(
-    "…and the aim still lands just past midnight",
-    win !== undefined && win >= MIDNIGHT && win - MIDNIGHT <= 700,
-    win === undefined ? "no 200" : `${win - MIDNIGHT}ms after midnight`,
+    "…and the accepted POST still lands on the flip",
+    win !== undefined && win.at >= MIDNIGHT && win.at - MIDNIGHT <= 2 * KNOCK_MS + 60,
+    win === undefined ? "no 200" : `sent ${rel(win.at)}, row ${rel(win.done)}`,
+  );
+}
+
+// ── 11. A lost response: the slow failure must read as "already booked" ────
+reset();
+S.flipAt = MIDNIGHT;
+S.lostOnce.add("a@x.com"); // the job runs and the row is written, the answer dies
+const dropped = await runCheckInAll([
+  { chatId: "tg:1", account: account("a@x.com") },
+], { runDate: RUN_DATE, retryUntil: Date.now() + 60_000 });
+check(
+  "a lost response still ends checked in",
+  outcomeAt(dropped, 0) === "checked_in",
+  outcomeAt(dropped, 0),
+);
+{
+  const rows = posts.filter((p) => p.user === "a@x.com" && p.status === 200);
+  const lostAt = rows[0]?.done ?? 0;
+  const tail = callsOf("a@x.com").filter((p) => p.at > lostAt);
+  check(
+    "…from the row the lost job wrote, without posting a second one",
+    rows.length === 1 && rows[0]!.day === S.runDate && tail.length === 0,
+    `${rows.length} 200(s), ${tail.length} POST(s) after it`,
   );
 }
 

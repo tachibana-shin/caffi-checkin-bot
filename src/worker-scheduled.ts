@@ -19,10 +19,10 @@
  * A cron invocation may run 15 minutes of wall time for 10ms of CPU, and
  * sleeping costs none of it.
  *
- * Placement only holds for fetch handlers, so this path is unplaced. That no
- * longer decides the race — the race is decided by the aim in the placed fetch
- * handler this cron wakes — it only makes the confirm reads after the win
- * slower.
+ * Placement only holds for fetch handlers, so this path is unplaced. The knock
+ * race is a round-trip loop — each knock costs one RTT plus a fast rejection —
+ * so placement now decides how tight it is; the cron still beats any placed
+ * fetch by minutes, and `/race` stays the placed path for an external scheduler.
  */
 import { apiFor, sleep } from "./checkin.ts";
 import { boot } from "./boot.ts";

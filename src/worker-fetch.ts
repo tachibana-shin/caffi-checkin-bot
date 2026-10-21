@@ -51,8 +51,8 @@ async function telegram(req: Request): Promise<Response> {
  *
  * Smart Placement applies to fetch handlers only, so this path runs placed next
  * to the Caffi servers while the cron handler does not — and the race is a
- * measured aim against the server's per-account job queue, so placement (the
- * short round trip it buys) is what makes the aim tight.
+ * knock loop, one POST per round trip until the server accepts, so placement
+ * (the short round trip it buys) is what makes it tight.
  *
  * The bearer token is WORKER_SECRET (BOT_SECRET when unset). Without it anyone
  * could force a run — the store's per-day markers would stop a real double

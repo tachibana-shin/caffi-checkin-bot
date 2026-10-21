@@ -17,11 +17,11 @@ scheduler; only the delivery differs.
 
 It runs in three shapes, picked by `RUNTIME_MODE` in [`src/config.ts`](src/config.ts):
 
-| shape     | where it runs         | transport                          | state                 | schedule                         |
-| --------- | --------------------- | ---------------------------------- | --------------------- | -------------------------------- |
-| `polling` | `deno task start`     | grammY long polling                | `data/store.kv`       | interval in `scheduler.ts`       |
-| `webhook` | Deno Deploy (retired) | `POST /telegram` from `Deno.serve` | Deno KV               | `Deno.cron`                      |
-| `worker`  | Cloudflare Workers    | `POST /telegram` from `fetch()`    | D1 (`src/records.ts`) | `scheduled` → self-`fetch /race` |
+| shape     | where it runs         | transport                          | state                 | schedule                                             |
+| --------- | --------------------- | ---------------------------------- | --------------------- | ---------------------------------------------------- |
+| `polling` | `deno task start`     | grammY long polling                | `data/store.kv`       | interval in `scheduler.ts`                           |
+| `webhook` | Deno Deploy (retired) | `POST /telegram` from `Deno.serve` | Deno KV               | `Deno.cron`                                          |
+| `worker`  | Cloudflare Workers    | `POST /telegram` from `fetch()`    | D1 (`src/records.ts`) | `scheduled` ticks directly; `/race` for cron-job.com |
 
 **Anyone can use the bot.** Every chat is keyed by its own id (`tg:<chat>`), so each person manages
 exactly one set of accounts and can never see another user's data.
@@ -104,19 +104,20 @@ milliseconds later (**+134ms** and **+263ms** on two measured nights), while 10t
 ~2.9s. So the bot **wakes up before** the scheduled time instead of at it — but what it does across
 midnight is no longer a grid of shots, because the server **queues** check-ins.
 
-The server does not check a POST in when it arrives. It puts the request on a **per-account queue**,
-runs it as a job (measured 200ms–2s), and while that job is alive every other POST from the same
-account is answered `429 CHECK_IN_QUEUE_FULL` ("Điểm danh của bạn đang được xử lý…"). The row — the
-`createdAt` the leaderboard ranks — is written when the job **finishes**. A grid is therefore
-useless: only the first shot enters the queue, the rest bounce off the 429, and whatever duration
-the one job in flight happens to have decides the rank. That is why shot grids still landed
-**+1188ms** and **+1320ms** while the day's leader sat at +119ms.
+The server does not check a POST in when it arrives. Before the day opens, a POST is answered `400`
+— "Hôm nay bạn đã điểm danh rồi" — in one round trip (~65ms): no queue, no job, nothing to measure.
+Once it opens, the first POST starts a **per-account job** (~500ms off-peak, ~1.4s under the
+midnight burst), any other POST while it runs is answered `429 CHECK_IN_QUEUE_FULL` ("Điểm danh của
+bạn đang được xử lý…"), and the row — the `createdAt` the leaderboard ranks — is written when the
+job **finishes**.
 
-So the race is not "when to send" but **when the job finishes**. One shot goes out at a time; its
-round trip is a free stopwatch for how long the server is currently taking, and the next shot is
-sent so that _its_ job finishes just past midnight. A job that finishes before the flip answers
-"already done" (yesterday is still today, and it is booked) — that updates the stopwatch and the
-loop repeats. The first job that finishes after the flip **is** the check-in.
+So the job's duration is the server's to give, not ours to aim. What is ours is when the job
+**starts**, and that is the whole race: from 600ms before midnight the bot **knocks** — a POST, and
+the instant it comes back rejected, the next one, one round trip apart, until one is accepted. Every
+pre-flip knock is free, so the loop finds the server's own flip within one round trip and the first
+accepted job starts almost exactly on it. A flip a few hundred milliseconds _early_ — the winning
+rows have repeatedly been 200-400ms ahead of our midnight — is caught the same way, which is what
+the old grids and aims kept missing.
 
 | Env var                    | Default | Meaning                                                                           |
 | -------------------------- | ------- | --------------------------------------------------------------------------------- |
@@ -125,50 +126,56 @@ loop repeats. The first job that finishes after the flip **is** the check-in.
 
 What happens at run time (`runCheckIn` for one account, `runCheckInAll` for the nightly batch):
 
-1. Before midnight (`runCheckInAll`), each account runs the **completion-aimed race**
-   (`sprintCheckIn`): from 23:59:54 it fires shots one at a time — the aim subtracts the measured
-   round trip, so the job's finish, the `createdAt` the leaderboard ranks, lands a hair past
-   midnight (`aimSendAt` parks the response at +230ms, one return leg after the row is written), and
-   a second account is staggered 100ms so the two do not double up on the same instants.
+1. Before midnight (`runCheckInAll`), each account runs the **knock race** (`sprintCheckIn`): it
+   naps to 23:59:58.5 and reads once (pays any cold-start handshake there, where it costs nothing),
+   then from 23:59:59.4 it knocks — one POST per round trip, no sleep between them, until one is
+   accepted. A duplicate (`400`) is the next knock; a queue-full (`429`) waits 150ms; a rate limit
+   stands that account down. The accounts knock independently of each other.
 2. A 200 wins — provided the pre-race read vouched for the day. If it could not (the read failed, or
    it showed yesterday was never booked), the job's own `history[].checkInDate` must reach `runDate`
    first (`OPEN (verified)`). The status is then read back until it actually reflects the check-in —
    the wallet row is written ~200ms before the check-in row, so the very first read can still return
    the previous streak (observed: it answered 3 when the correct value was 4).
-3. The one thing a clock cannot tell us is how far the server's own midnight sits from ours, so it
-   is learned: the winning row's `createdAt` is the server's clock, so `response time − createdAt`
-   is the offset. It is stored as `race:skew` and folded into the next night's aim.
-4. A race that never lands after the flip — the server's midnight further from ours than the aim
-   assumes — falls back to `runCheckIn`, which reads first: `todayCheckedIn === false` → the day
+3. A duplicate that took a job's worth of time (≥300ms) is a **post-flip** answer — the day is open
+   and already booked. The status is read once, and if it shows `runDate` booked the day is settled
+   as won. That is the net for a response lost on the way back: the job ran, the row was written.
+4. Diagnostics, for tuning the lead from the traces alone: `race:shots:<account>` keeps every knock
+   (send time, round trip, what the server said), and `race:win:<account>` keeps the winning row's
+   `createdAt` (`rowDelta` against our midnight) plus how long its job took (`jobMs`).
+5. A race that never lands inside the 3s window — the server's midnight further from ours than the
+   lead covers — falls back to `runCheckIn`, which reads first: `todayCheckedIn === false` → the day
    opened → `POST
    /check-in` **immediately**; otherwise, while the newest `history[].checkInDate`
    is still _before_ the target day, it keeps re-reading — **50ms** across the two seconds either
    side of the deadline, then 1s for the first 20s, then 10s (`pollDelay`). A premature `POST` that
    the server rejects is retried the same way, until `CHECKIN_MAX_WAIT_SECONDS` elapses.
    Rate-limited responses are _not_ retried; queue-full ones are.
-5. A run that starts once the day is already open — a restart, the catch-up cron, a re-run — cannot
+6. A run that starts once the day is already open — a restart, the catch-up cron, a re-run — cannot
    race anyone, so each account answers on its own session and "already checked in" is honoured per
    login.
-6. Access tokens are refreshed up front (`CaffiApi.warm`) when their JWT `exp` is near: a 401-driven
+7. Access tokens are refreshed up front (`CaffiApi.warm`) when their JWT `exp` is near: a 401-driven
    refresh costs two extra round trips, and they must not land on the race.
 
-**Why not a grid, and why reads cannot win.** The flip is only visible inside a status response, so
-a POST sent after seeing it leaves one full round trip after the server has already opened — on a
-~265ms link that is most of the ranking, and it is why 2026-10-09 put one account at rank 3 /
-00:00:00 and the next at rank 10 / 00:00:01. Midnight itself needs no reading: it is a fixed epoch
-per `runDate`. But sending _without_ reading is not enough either, because the server decides the
-rank when its queued job finishes, not when the POST arrives. The aim is pinned in
-`scripts/timing.ts`; `scripts/batch.ts` replays the whole night offline against a stubbed Caffi that
-queues jobs the same way.
+**Why a knock, and why a grid or a read cannot win.** A grid spends its shots before the flip does
+anything: only the POST that arrives after the flip starts a job, and any POST that arrives while
+that job runs bounces off the queue. A tight knock loop, on the other hand, is free until the flip —
+every pre-flip POST is rejected in one round trip and never queued — so it pins the job's start to
+the server's own flip rather than to a guess about it. Reads cannot win either: the flip is only
+visible inside a status response, so a POST sent after seeing it leaves one full round trip after
+the server has already opened — on a ~265ms link that is most of the ranking, and it is why
+2026-10-09 put one account at rank 3 / 00:00:00 and the next at rank 10 / 00:00:01. Midnight itself
+needs no reading: it is a fixed epoch per `runDate`. `scripts/batch.ts` replays the whole night
+offline against a stubbed Caffi that queues jobs and rejects pre-flip knocks the same way;
+`scripts/timing.ts` covers the fallback's poll cadence.
 
 A missed night is the one wrinkle: if yesterday was never booked, the server's "today" is still
-yesterday, and the first job to finish books **it** — a 200 that would otherwise look like tonight's
-win. One status read goes out before the race (and the race waits for its answer) to ask whether
-yesterday is booked: a read that landed after one of our own repair jobs would see the repair and
-mis-trust the day. When it cannot be answered, a dubious 200 is settled by the history date — a job
-that books yesterday is logged as `booked an earlier day` and the race keeps aiming. If a wrong-day
-200 ever slips through, the day is reported unfinished (`pending_day`) rather than marked done, so
-the 00:28 catch-up finishes it — never a night lost to a misread 200.
+yesterday, and the first job books **it** — a 200 that would otherwise look like tonight's win. One
+status read goes out before the race (and the race waits for its answer) to ask whether yesterday is
+booked: a read that landed after one of our own repair jobs would see the repair and mis-trust the
+day. When it cannot be answered, a dubious 200 is settled by the history date — a job that books
+yesterday is logged as `booked an earlier day` and the race keeps knocking. If a wrong-day 200 ever
+slips through, the day is reported unfinished (`pending_day`) rather than marked done, so the 00:28
+catch-up finishes it — never a night lost to a misread 200.
 
 The pre-roll also makes one read per account **before** it naps — a cold isolate's first request to
 Caffi costs ~1.1s against ~265ms warm, and on 09-10 that cold start was most of the +1730ms the
@@ -272,15 +279,15 @@ cron trigger — and `src/records.ts` hides which database is behind the store:
 | -------- | ------------------------------------------ | ----------------------------------------------------------- |
 | Telegram | grammY long polling                        | `POST /telegram`, `X-Telegram-Bot-Api-Secret-Token` checked |
 | state    | `data/store.kv` (`store.json` before that) | one row in D1, key `caffi store`                            |
-| schedule | timers in `src/scheduler.ts`               | `scheduled` → self-`fetch /race` → the same runner          |
+| schedule | timers in `src/scheduler.ts`               | `scheduled` runs the same runner, unplaced                  |
 
 ### The schedule
 
-|            |                                                                          |
-| ---------- | ------------------------------------------------------------------------ |
-| **Race**   | Cloudflare cron `56 16 * * *` (23:56 VN) — warm, nap 235s, then the grid |
-| **Net**    | Cloudflare cron `28 17 * * *` (00:28 VN) — `tick(true)`, if unfinished   |
-| **Backup** | cron-job.com calls `/race?job=pre-roll` at 00:00 VN (optional)           |
+|            |                                                                        |
+| ---------- | ---------------------------------------------------------------------- |
+| **Race**   | Cloudflare cron `56 16 * * *` (23:56 VN) — warm, nap, tick directly    |
+| **Net**    | Cloudflare cron `28 17 * * *` (00:28 VN) — `tick(true)`, if unfinished |
+| **Backup** | cron-job.com calls `/race?job=pre-roll` at 00:00 VN (optional, placed) |
 
 Cron has minute resolution, and every scheduler measured so far fires late — so the pre-roll fires
 three minutes early and the handler **naps** the rest. The nap is what turns a jittery trigger into
@@ -292,20 +299,18 @@ an on-time one:
 
 A cron invocation may run for 15 minutes of wall time and sleeping costs no CPU, so 235 seconds of
 nap are free. What the pre-roll then does, in order: boot, one status read per account (which pays
-the cold isolate's ~1.1s while the second is still worth nothing), nap to 23:59:55, re-warm — the
-connections idled for minutes and a server may have dropped them — and only then fire the blind
-grid: each account's shots start 900ms before midnight and land every 200ms, and the first one after
-the flip is the check-in.
+the cold isolate's ~1.1s while the second is still worth nothing), nap to the window, re-warm — the
+connections idled for minutes and a server may have dropped them — and only then knock: from 600ms
+before midnight, one POST per round trip until one is accepted, so the winning job starts on the
+server's own flip.
 
-**Why the race does not go over HTTP any more.** Smart Placement applies to fetch handlers only, so
-an HTTP trigger does end up placed near the Caffi servers while the cron handler does not. But the
-grid is bounded by its own spacing, not by the round trip, so placement no longer decides the race —
-while a late trigger still costs a minute: 64 seconds late is not a trade worth a 200ms round trip.
-
-The old HTTP arrangement could not have won anyway — a Worker cannot subrequest itself
-(`workers.dev` answers 404, a custom domain 522), so the cron handler's "wake `/race` over HTTP"
-never ran. On 2026-10-11 the pre-roll fired at 23:56:26, reported Success, and the day's check-in
-landed at 00:14:55 — by hand.
+**Placement.** Smart Placement applies to fetch handlers only: a request into `/race` runs near the
+Caffi servers, while the `scheduled` handler runs wherever the cron runs. The knock loop is a
+round-trip loop, so placement now decides how tight it is — ~65ms per knock when placed against the
+cron handler's own RTT. A Worker cannot subrequest itself (`workers.dev` answers 404, a custom
+domain 522), so the cron handler cannot "wake `/race` over HTTP": it ticks directly, unplaced, and
+`/race` is there for an external scheduler that can hit it. On 2026-10-11 the pre-roll fired at
+23:56:26, reported Success, and the day's check-in landed at 00:14:55 — by hand.
 
 **cron-job.com is a backup, not the race.** Its free tier cuts a job off after 30 seconds and its
 crontab has no seconds field, so it cannot aim at 23:59:55 and it fires late; but if a platform
@@ -402,11 +407,11 @@ nohup deno task start > bot.log 2>&1 &
 ```bash
 deno task check         # type check
 deno task lint
-deno task timing        # offline: midnight window, aim geometry, poll cadence, decision rules
+deno task timing        # offline: midnight window, poll cadence, decision rules
 deno task view          # offline: every screen rendered as Telegram HTML
 deno task wiring        # offline grammY routing test (no Telegram calls)
 deno task smoke         # store encryption round-trip + live API error branches
-deno task batch         # offline: the nightly batch — the queued aim across a stubbed midnight
+deno task batch         # offline: the nightly batch — the knock race across a stubbed midnight
 deno task deploycheck   # offline pre-flight + live probes once PUBLIC_URL is in .env
 ```
 
